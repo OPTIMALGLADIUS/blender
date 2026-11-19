@@ -37,11 +37,11 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 1
-          lfs: true
 
       - name: Pull Git LFS assets
         run: |
           sudo apt-get update && sudo apt-get install -y --no-install-recommends git-lfs
+          git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
           git lfs install
           git lfs pull
 
