@@ -52,7 +52,16 @@ jobs:
             zip \
             unzip \
             python3 \
-            ccache
+            ccache \
+            libx11-dev \
+            libxxf86vm-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxkbcommon-dev \
+            libdbus-1-dev \
+            libegl1-mesa-dev
           if ! g++ --version | grep -qE "g\+\+ \(.*\) (14|15|16)\."; then
             sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
             sudo apt-get update
