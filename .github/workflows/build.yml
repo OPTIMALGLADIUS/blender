@@ -69,7 +69,7 @@ jobs:
 
       - name: Install required SDK platforms, build-tools, and NDK
         run: |
-          sdkmanager \
+          sdkmanager --include_unstable\
             "ndk;${ANDROID_NDK_VERSION}" \
             "platform-tools" \
             "build-tools;35.0.1" \
