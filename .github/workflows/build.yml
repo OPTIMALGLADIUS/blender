@@ -14,7 +14,7 @@ concurrency:
 env:
   ANDROID_HOME: /home/runner/android-sdk
   ANDROID_SDK_ROOT: /home/runner/android-sdk
-  ANDROID_NDK_VERSION: "30.0.14904198-beta1"
+  ANDROID_NDK_VERSION: "30.0.16248370"
   CCACHE_DIR: /home/runner/work/blender/blender/.ccache
   CCACHE_MAXSIZE: "6G"
 
@@ -69,11 +69,24 @@ jobs:
 
       - name: Install required SDK platforms, build-tools, and NDK
         run: |
-          sdkmanager --channel=1 \
-            "ndk;${ANDROID_NDK_VERSION}" \
+          sdkmanager \
             "platform-tools" \
             "build-tools;35.0.1" \
             "platforms;android-35"
+
+          NDK_DIR="${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}"
+          if ! sdkmanager "ndk;${ANDROID_NDK_VERSION}"; then
+            curl -fL -o /tmp/android-ndk-r30-linux.zip \
+              "https://dl.google.com/android/repository/android-ndk-r30-linux.zip"
+            unzip -q /tmp/android-ndk-r30-linux.zip -d /tmp
+            mkdir -p "${ANDROID_HOME}/ndk"
+            rm -rf "${NDK_DIR}"
+            mv /tmp/android-ndk-r30 "${NDK_DIR}"
+            rm -f /tmp/android-ndk-r30-linux.zip
+          fi
+
+          # Keep compatibility if env.sh looks for the earlier beta folder name
+          ln -sfn "${NDK_DIR}" "${ANDROID_HOME}/ndk/30.0.14904198-beta1"
 
       - name: Pull Git LFS assets and initialize submodules
         run: |
