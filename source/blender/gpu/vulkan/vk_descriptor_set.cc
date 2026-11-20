@@ -48,15 +48,7 @@ void VKDescriptorSetTracker::update_descriptor_set(VKContext &context,
 
   update_resource_access_info(context, access_info, push_constants_buffer);
 
-  /* Can we reuse previous descriptor set. */
   const VkDescriptorSetLayout shader_descriptor_set_layout = shader.vk_descriptor_set_layout_get();
-  if (!state_manager.is_dirty && vk_descriptor_set_layout_ == shader_descriptor_set_layout &&
-      shader.push_constants.layout_get().storage_type_get() !=
-          VKPushConstants::StorageType::BUFFER)
-  {
-    r_pipeline_data.vk_descriptor_set = descriptor_sets.vk_descriptor_set;
-    return;
-  }
   vk_descriptor_set_layout_ = shader_descriptor_set_layout;
   state_manager.is_dirty = false;
 
@@ -239,8 +231,8 @@ void VKDescriptorSetTracker::update_resource_access_info_binding_input_attachmen
   if (vk_image != VK_NULL_HANDLE) {
     VKSubImageRange subimage = {};
     if (texture->is_texture_view()) {
-      IndexRange layer_range = texture->layer_range();
-      IndexRange mipmap_range = texture->mip_map_range();
+      IndexRange layer_range = texture.layer_range();
+      IndexRange mipmap_range = texture.mip_map_range();
       subimage = {uint32_t(mipmap_range.start()),
                   uint32_t(mipmap_range.size()),
                   uint32_t(layer_range.start()),
