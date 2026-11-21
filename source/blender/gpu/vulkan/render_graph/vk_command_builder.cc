@@ -89,19 +89,13 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
   group_post_barriers_.clear();
   node_pre_barriers_.resize(node_handles.size());
 
-  /* Keep track of the post barriers that needs to be added. The pre barriers will be stored
-   * directly in `barrier_list_` but may not mingle with the pre barriers. Most barriers are
-   * group pre barriers. */
   Vector<Barrier> post_barriers;
-  /* Keep track of the node pre barriers that needs to be added. The pre barriers will be stored
-   * directly in `barrier_list_` but may not mingle with the group barriers. */
   Vector<Barrier> node_pre_barriers;
 
   NodeHandle rendering_scope;
   bool rendering_active = false;
 
   for (const int64_t group_index : group_nodes_.index_range()) {
-    /* Extract the pre-barriers of this group. */
     Barriers group_pre_barriers(barrier_list_.size(), 0);
     const GroupNodes &node_group = group_nodes_[group_index];
     for (const int64_t group_node_index : node_group) {
@@ -111,18 +105,9 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
       build_pipeline_barriers(
           render_graph, node_handle, node.pipeline_stage_get(), image_tracker, barrier);
       if (!barrier.is_empty()) {
-#if 0
-        std::cout << __func__ << ": node_group=" << group_index
-                  << ", node_group_range=" << node_group.first() << "-" << node_group.last()
-                  << ", node_handle=" << node_handle << ", node_type=" << node.type
-                  << ", debug_group=" << render_graph.full_debug_group(node_handle) << "\n";
-        std::cout << __func__ << ": " << to_string_barrier(barrier);
-#endif
         barrier_list_.append(barrier);
       }
 
-      /* Reset the tracked layout of aliased images to undefined once their memory can be reused.
-       */
       if (node.type == VKNodeType::SYNCHRONIZATION &&
           node.synchronization.reset_layout_to_undefined)
       {
@@ -132,34 +117,19 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
           resource.barrier_state.image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         }
       }
-
-      /* Check for additional barriers when resuming rendering.
-       *
-       * Between suspending rendering and resuming the state/layout of resources can change and
-       * require additional barriers.
-       */
       else if (node.type == VKNodeType::BEGIN_RENDERING) {
-        /* Begin rendering scope. */
         BLI_assert(!rendering_active);
         rendering_scope = node_handle;
         rendering_active = true;
         image_tracker.begin(render_graph, node_handle);
       }
-
       else if (node.type == VKNodeType::END_RENDERING) {
-        /* End rendering scope. */
         BLI_assert(rendering_active);
 
-        /* Save rendering scope handle for resource state update below. */
         const NodeHandle end_rendering_scope = rendering_scope;
         rendering_scope = 0;
         rendering_active = false;
 
-        /* The render pass storeOp writes each attachment with COLOR_ATTACHMENT_WRITE_BIT (or
-         * DEPTH_STENCIL_ATTACHMENT_WRITE_BIT). END_RENDERING has VKResourceType::NONE and
-         * declares no resource dependencies, so these implicit writes are invisible to the
-         * resource state tracker. Propagate them here so the next scope's pipeline barrier
-         * correctly synchronizes with the storeOp, avoiding WRITE_AFTER_WRITE hazards. */
         for (const VKRenderGraphImage &link : render_graph.linked_images(end_rendering_scope)) {
           VKResourceStateTracker::Resource &resource = render_graph.resources_.get_image_resource(
               link.resource.handle);
@@ -172,18 +142,12 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
           }
         }
 
-        /* Any specific layout changes needs to be reverted, so the global resource state tracker
-         * reflects the correct state. These barriers needs to be added as node post barriers. We
-         * assume that END_RENDERING is always the last node of a group. */
         Barrier barrier = {};
         image_tracker.end(barrier, use_local_read);
         if (!barrier.is_empty()) {
           post_barriers.append(barrier);
         }
 
-        /* After image_tracker.end() reverts tracked image layouts back to the default layout,
-         * sync the global resource state tracker so subsequent barriers use the correct
-         * oldLayout. */
         for (const VKRenderGraphImage &link : render_graph.linked_images(end_rendering_scope)) {
           VKResourceStateTracker::Resource &resource = render_graph.resources_.get_image_resource(
               link.resource.handle);
@@ -193,21 +157,15 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
           }
         }
       }
-
       else if (rendering_active && !node_type_is_within_rendering(node.type)) {
-        /* Suspend active rendering scope. */
         rendering_active = false;
 
-        /* Any specific layout changes needs to be reverted, so the global resource state tracker
-         * reflects the correct state. These barriers needs to be added as node post barriers.
-         */
         Barrier barrier = {};
         image_tracker.suspend(barrier, use_local_read);
         if (!barrier.is_empty()) {
           post_barriers.append(barrier);
         }
 
-        /* Sync resource state layout after suspend reverts tracked images. */
         for (const VKRenderGraphImage &link : render_graph.linked_images(rendering_scope)) {
           VKResourceStateTracker::Resource &resource = render_graph.resources_.get_image_resource(
               link.resource.handle);
@@ -217,9 +175,7 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
           }
         }
       }
-
       else if (!rendering_active && node_type_is_within_rendering(node.type)) {
-        /* Resume rendering scope. */
         VKRenderGraphNode &rendering_node = render_graph.nodes_[rendering_scope];
         Barrier barrier = {};
         build_pipeline_barriers(render_graph,
@@ -231,8 +187,6 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
           barrier_list_.append(barrier);
         }
 
-        /* Resume layered tracking. Each layer that has an override will be transition back to
-         * the layer specific image layout. */
         barrier = {};
         image_tracker.resume(barrier, use_local_read);
         if (!barrier.is_empty()) {
@@ -242,7 +196,6 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
         rendering_active = true;
       }
 
-      /* Extract pre barriers for nodes. */
       if (use_local_read && node_type_is_within_rendering(node.type) &&
           node_has_input_attachments(render_graph, node_handle))
       {
@@ -255,19 +208,12 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
       }
     }
     if (rendering_active) {
-      /* Suspend layered image tracker. When active the next group will always be a compute/data
-       * transfer group.
-       *
-       * Any specific layout changes needs to be reverted, so the global resource state tracker
-       * reflects the correct state. These barriers needs to be added as node post barriers.
-       */
       Barrier barrier = {};
       image_tracker.suspend(barrier, use_local_read);
       if (!barrier.is_empty()) {
         post_barriers.append(barrier);
       }
 
-      /* Sync resource state layout after the tracker reverts tracked images. */
       for (const VKRenderGraphImage &link : render_graph.linked_images(rendering_scope)) {
         VKResourceStateTracker::Resource &resource = render_graph.resources_.get_image_resource(
             link.resource.handle);
@@ -280,10 +226,6 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
       rendering_active = false;
     }
 
-    /* After all node barriers have been extracted, check if depth/stencil attachments in
-     * BEGIN_RENDERING were transitioned to a non-optimal layout by group pre-barriers. If so,
-     * fix up VkRenderingAttachmentInfo.imageLayout to match the actual GPU layout, and add an
-     * acquire barrier when LOAD_OP_LOAD is used to ensure memory visibility. */
     {
       NodeHandle first_handle = node_handles[node_group.first()];
       VKRenderGraphNode &first_node = render_graph.nodes_[first_handle];
@@ -305,7 +247,6 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
             continue;
           }
 
-          /* Fix up the imageLayout to reflect the actual GPU layout after all pre-barriers. */
           if (link.vk_image_aspect & VK_IMAGE_ASPECT_DEPTH_BIT &&
               begin_data.vk_rendering_info.pDepthAttachment != nullptr)
           {
@@ -317,9 +258,6 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
             begin_data.stencil_attachment.imageLayout = gpu_layout;
           }
 
-          /* When LOAD_OP_LOAD is used with a non-optimal layout, the existing layout transition
-           * barriers may not provide proper memory visibility for the load operation. Add an
-           * acquire barrier to ensure prior writes are visible before the depth/stencil test. */
           bool depth_load = (link.vk_image_aspect & VK_IMAGE_ASPECT_DEPTH_BIT) &&
                             begin_data.vk_rendering_info.pDepthAttachment != nullptr &&
                             begin_data.depth_attachment.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -350,8 +288,6 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
       }
     }
 
-    /* Update the group pre and post barriers. Pre barriers are already stored in the
-     * barrier_list_. The post barriers are appended after the pre barriers. */
     int64_t barrier_list_size = barrier_list_.size();
     group_pre_barriers_.append(group_pre_barriers.with_new_end(barrier_list_size));
     barrier_list_.extend(std::move(post_barriers));
@@ -362,7 +298,6 @@ void VKCommandBuilder::groups_extract_barriers(VKRenderGraph &render_graph,
       barrier_list_size = barrier_list_.size();
       barrier_list_.extend(std::move(node_pre_barriers));
       node_pre_barriers = {};
-      /* Shift all node pre barrier references to the new location in the barrier_list_. */
       for (const int64_t group_node_index : node_group) {
         NodeHandle node_handle = node_handles[group_node_index];
         if (!node_pre_barriers_[node_handle].is_empty()) {
@@ -391,21 +326,13 @@ void VKCommandBuilder::groups_build_commands(VKRenderGraph &render_graph,
     IndexRange group_nodes = group_nodes_[group_index];
     Span<NodeHandle> group_node_handles = node_handles.slice(group_nodes);
 
-    /* Record group pre barriers. */
     for (BarrierIndex barrier_index : group_pre_barriers_[group_index]) {
       BLI_assert_msg(!rendering_active,
                      "Pre group barriers must be executed outside a rendering scope.");
       Barrier &barrier = barrier_list_[barrier_index];
-#if 0
-      std::cout << __func__ << ": node_group=" << group_index
-                << ", node_group_range=" << group_node_handles.first() << "-"
-                << group_node_handles.last() << ", pre_barrier=(" << to_string_barrier(barrier)
-                << ")\n";
-#endif
       send_pipeline_barriers(command_buffer, barrier, false);
     }
 
-    /* Record group node commands. */
     for (NodeHandle node_handle : group_node_handles) {
       VKRenderGraphNode &node = render_graph.nodes_[node_handle];
 
@@ -417,13 +344,11 @@ void VKCommandBuilder::groups_build_commands(VKRenderGraph &render_graph,
         rendering_scope = node_handle;
         rendering_active = true;
       }
-
       else if (node.type == VKNodeType::END_RENDERING) {
         rendering_active = false;
       }
       else if (node_type_is_within_rendering(node.type)) {
         if (!rendering_active) {
-          /* Restart rendering scope. */
           VKRenderGraphNode &rendering_node = render_graph.nodes_[rendering_scope];
           VKBeginRenderingNode::reconfigure_for_restart(
               render_graph.storage_.begin_rendering[rendering_node.storage_index]);
@@ -432,32 +357,15 @@ void VKCommandBuilder::groups_build_commands(VKRenderGraph &render_graph,
         }
       }
 
-      /* Record group node barriers. (VK_EXT_dynamic_rendering_local_read) */
       for (BarrierIndex node_pre_barrier_index : node_pre_barriers_[node_handle]) {
         Barrier &barrier = barrier_list_[node_pre_barrier_index];
-#if 0
-      std::cout << __func__ << ": node_group=" << group_index
-                << ", node_group_range=" << group_node_handles.first() << "-"
-                << group_node_handles.last() << ", node_pre_barrier=(" << to_string_barrier(barrier)
-                << ")\n";
-#endif
-        /* TODO: Barrier should already contain the changes for local read. */
         send_pipeline_barriers(command_buffer, barrier, true);
       }
 
-#if 0
-      std::cout << __func__ << ": node_group=" << group_index
-                << ", node_group_range=" << group_node_handles.first() << "-"
-                << group_node_handles.last() << ", node_handle=" << node_handle
-                << ", node_type=" << node.type
-                << ", debug group=" << render_graph.full_debug_group(node_handle) << "\n";
-#endif
       node.build_commands(command_buffer, render_graph.storage_, active_pipelines);
     }
 
     if (rendering_active) {
-      /* Suspend rendering as the next node group will contain data transfer/dispatch commands.
-       */
       rendering_active = false;
       if (command_buffer.use_render_pass_fallback) {
         command_buffer.end_render_pass();
@@ -467,17 +375,10 @@ void VKCommandBuilder::groups_build_commands(VKRenderGraph &render_graph,
       }
     }
 
-    /* Record group post barriers. */
     for (BarrierIndex barrier_index : group_post_barriers_[group_index]) {
       BLI_assert_msg(!rendering_active,
                      "Post group barriers must be executed outside a rendering scope.");
       Barrier &barrier = barrier_list_[barrier_index];
-#if 0
-      std::cout << __func__ << ": node_group=" << group_index
-                << ", node_group_range=" << group_node_handles.first() << "-"
-                << group_node_handles.last() << ", post_barrier=(" << to_string_barrier(barrier)
-                << ")\n";
-#endif
       send_pipeline_barriers(command_buffer, barrier, false);
     }
   }
@@ -504,7 +405,6 @@ void VKCommandBuilder::activate_debug_group(VKRenderGraph &render_graph,
     return;
   }
 
-  /* Determine the number of pops and pushes that will happen on the debug stack. */
   int num_ends = 0;
   int num_begins = 0;
 
@@ -531,13 +431,11 @@ void VKCommandBuilder::activate_debug_group(VKRenderGraph &render_graph,
     num_begins = to_group.size() - (debug_groups.debug_level - num_ends);
   }
 
-  /* Perform the pops from the debug stack. */
   for (int index = 0; index < num_ends; index++) {
     command_buffer.end_debug_utils_label();
   }
   debug_groups.debug_level -= num_ends;
 
-  /* Perform the pushes to the debug stack. */
   if (num_begins > 0) {
     Vector<VKRenderGraph::DebugGroupNameID> &to_group =
         render_graph.debug_.used_groups[debug_group];
@@ -577,12 +475,6 @@ void VKCommandBuilder::build_pipeline_barriers(VKRenderGraph &render_graph,
   add_buffer_barriers(render_graph, node_handle, pipeline_stage, r_barrier);
 }
 
-/** \} */
-
-/* -------------------------------------------------------------------- */
-/** \name Pipeline barriers
- * \{ */
-
 void VKCommandBuilder::reset_barriers(Barrier &r_barrier)
 {
   r_barrier.dst_stage_mask = r_barrier.src_stage_mask = VK_PIPELINE_STAGE_NONE;
@@ -596,22 +488,12 @@ void VKCommandBuilder::send_pipeline_barriers(VKCommandBufferInterface &command_
     return;
   }
 
-  /* When no resources have been used, we can start the barrier at the top of the pipeline.
-   * It is not allowed to set it to None. */
-  /* TODO: VK_KHR_synchronization2 allows setting src_stage_mask to NONE. */
-  /* When no resources have been used, we can start the barrier at the top of the pipeline.
-   * It is not allowed to set it to None. */
   VkPipelineStageFlags src_stage_mask = (barrier.src_stage_mask == VK_PIPELINE_STAGE_NONE) ?
                                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT :
                                             VkPipelineStageFlagBits(barrier.src_stage_mask);
 
   VkPipelineStageFlags dst_stage_mask = barrier.dst_stage_mask;
-  /* TODO: this should be done during barrier extraction making within_rendering obsolete. */
   if (within_rendering) {
-    /* See: VUID - `vkCmdPipelineBarrier` - `srcStageMask` - 09556
-     * If `vkCmdPipelineBarrier` is called within a render pass instance started with
-     * `vkCmdBeginRendering`, this command must only specify frame-buffer-space stages in
-     * `srcStageMask` and `dstStageMask`. */
     src_stage_mask = dst_stage_mask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
                                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                       VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
@@ -664,7 +546,6 @@ void VKCommandBuilder::add_buffer_read_barriers(VKRenderGraph &render_graph,
         (resource_state.vk_access & link.vk_access_flags) == link.vk_access_flags &&
         (resource_state.vk_pipeline_stages & node_stages) == node_stages)
     {
-      /* Has already been covered in a previous call no need to add this one. */
       continue;
     }
 
@@ -725,14 +606,10 @@ void VKCommandBuilder::add_buffer_barrier(VkBuffer vk_buffer,
            r_barrier.buffer_memory_barriers.start()))
   {
     if (vk_buffer_memory_barrier.buffer == vk_buffer) {
-      /* When registering read/write buffers, it can be that the node internally requires
-       * read/write. In this case we adjust the dstAccessMask of the read barrier. */
       if ((vk_buffer_memory_barrier.dstAccessMask & src_access_mask) == src_access_mask) {
         vk_buffer_memory_barrier.dstAccessMask |= dst_access_mask;
         return;
       }
-      /* When re-registering resources we can skip if access mask already contain all the flags.
-       */
       if ((vk_buffer_memory_barrier.dstAccessMask & dst_access_mask) == dst_access_mask &&
           (vk_buffer_memory_barrier.srcAccessMask & src_access_mask) == src_access_mask)
       {
@@ -789,16 +666,12 @@ void VKCommandBuilder::add_image_read_barriers(VKRenderGraph &render_graph,
         (resource_state.vk_pipeline_stages & node_stages) == node_stages &&
         resource_state.image_layout == link.vk_image_layout)
     {
-      /* Has already been covered in previous barrier no need to add this one. */
       continue;
     }
     if (within_rendering && link.vk_image_layout != VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR) {
-      /* Allow only local read barriers inside rendering scope */
       continue;
     }
 
-    /* Check if this image is being tracked as layered color attachment. In that case we are not
-     * allowed to update the resource state as it will be reverted by the image tracker. */
     if (image_tracker.contains(resource.image.vk_image)) {
       if (resource_state.image_layout != link.vk_image_layout) {
         image_tracker.update(resource.image.vk_image,
@@ -807,10 +680,7 @@ void VKCommandBuilder::add_image_read_barriers(VKRenderGraph &render_graph,
                              link.vk_image_layout,
                              link.vk_image_aspect,
                              r_barrier);
-        resource_state.image_layout = link.vk_image_layout;
       }
-      /* Image tracker only tracks layout changes. Access flag synchronization is still needed
-       * to avoid WRITE->READ hazards between rendering scopes. See #158501. */
       VkAccessFlags wait_access = resource_state.vk_access;
       r_barrier.src_stage_mask |= resource_state.vk_pipeline_stages;
       r_barrier.dst_stage_mask |= node_stages;
@@ -880,12 +750,9 @@ void VKCommandBuilder::add_image_write_barriers(VKRenderGraph &render_graph,
     VKResourceBarrierState &resource_state = resource.barrier_state;
     const VkAccessFlags wait_access = resource_state.vk_access;
     if (within_rendering && link.vk_image_layout != VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR) {
-      /* Allow only local read barriers inside rendering scope */
       continue;
     }
 
-    /* Check if this image is being tracked as layered color attachment. In that case we are not
-     * allowed to update the resource state as it will be reverted by the image tracker. */
     if (image_tracker.contains(resource.image.vk_image)) {
       if (resource_state.image_layout != link.vk_image_layout) {
         image_tracker.update(resource.image.vk_image,
@@ -894,10 +761,7 @@ void VKCommandBuilder::add_image_write_barriers(VKRenderGraph &render_graph,
                              link.vk_image_layout,
                              link.vk_image_aspect,
                              r_barrier);
-        resource_state.image_layout = link.vk_image_layout;
       }
-      /* Image tracker only tracks layout changes. Access flag synchronization is still needed
-       * to avoid READ->WRITE hazards between rendering scopes. See #158501. */
       r_barrier.src_stage_mask |= resource_state.vk_pipeline_stages;
       r_barrier.dst_stage_mask |= node_stages;
       resource_state.vk_access = link.vk_access_flags;
@@ -950,23 +814,14 @@ void VKCommandBuilder::add_image_barrier(VkImage vk_image,
            r_barrier.image_memory_barriers.start()))
   {
     if (vk_image_memory_barrier.image == vk_image) {
-      /* When registering read/write buffers, it can be that the node internally requires
-       * read/write. In this case we adjust the dstAccessMask of the read barrier. An example is
-       * EEVEE update HIZ compute shader and shadow tagging. */
       if ((vk_image_memory_barrier.dstAccessMask & src_access_mask) == src_access_mask) {
         vk_image_memory_barrier.dstAccessMask |= dst_access_mask;
         vk_image_memory_barrier.srcAccessMask |= src_access_mask;
-        /* When the existing barrier's newLayout matches the new barrier's
-         * oldLayout, update to the combined layout transition. For example,
-         * a read barrier (UNDEFINED->TRANSFER_DST) followed by a write
-         * barrier (TRANSFER_DST->GENERAL) becomes UNDEFINED->GENERAL. */
         if (old_image_layout == vk_image_memory_barrier.newLayout) {
           vk_image_memory_barrier.newLayout = new_image_layout;
         }
         return;
       }
-      /* When re-registering resources we can skip if access mask already contain all the flags.
-       */
       if ((vk_image_memory_barrier.dstAccessMask & dst_access_mask) == dst_access_mask &&
           (vk_image_memory_barrier.srcAccessMask & src_access_mask) == src_access_mask &&
           old_image_layout == new_image_layout)
@@ -991,12 +846,6 @@ void VKCommandBuilder::add_image_barrier(VkImage vk_image,
                                      subimage.layer_base,
                                      subimage.layer_count}});
 }
-
-/** \} */
-
-/* -------------------------------------------------------------------- */
-/** \name Sub-resource tracking
- * \{ */
 
 void VKCommandBuilder::ImageTracker::begin(const VKRenderGraph &render_graph,
                                            NodeHandle node_handle)
@@ -1031,15 +880,12 @@ void VKCommandBuilder::ImageTracker::update(VkImage vk_image,
           change.vk_image_layout == new_layout,
           "We don't support more that one change of the same subimage multiple times during a "
           "rendering scope.");
-      /* Early exit as layer is in correct layout. This is a normal case as we expect multiple
-       * draw commands to take place during a rendering scope with the same layer access. */
       return;
     }
   }
 
   changes.append({vk_image, new_layout, aspect, subimage});
 
-  /* We should be able to do better. BOTTOM/TOP is really a worst case barrier. */
   r_barrier.src_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
   r_barrier.dst_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
   VkAccessFlags dst_access_mask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
@@ -1051,12 +897,6 @@ void VKCommandBuilder::ImageTracker::update(VkImage vk_image,
     dst_access_mask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
   }
-  /* NOTE: src_access_mask uses a conservative VK_ACCESS_TRANSFER_WRITE_BIT as a
-   * placeholder. The actual prior access flags are added by the sync barrier logic
-   * in add_image_read_barriers/add_image_write_barriers (via wait_access from the
-   * resource state tracker) and merged into this barrier by add_image_barrier's merge.
-   * TODO: Pass the actual tracked wait_access here instead, removing the redundant
-   * sync barrier and this placeholder. */
   command_builder.add_image_barrier(vk_image,
                                     r_barrier,
                                     VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1075,14 +915,12 @@ void VKCommandBuilder::ImageTracker::end(Barrier &r_barrier, bool use_local_read
 }
 
 void VKCommandBuilder::ImageTracker::suspend(Barrier &r_barrier, bool use_local_read)
-
 {
   if (changes.is_empty()) {
     return;
   }
 
   command_builder.reset_barriers(r_barrier);
-  /* We should be able to do better. BOTTOM/TOP is really a worst case barrier. */
   r_barrier.src_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
   r_barrier.dst_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
   int64_t start_index = command_builder.vk_image_memory_barriers_.size();
@@ -1103,16 +941,6 @@ void VKCommandBuilder::ImageTracker::suspend(Barrier &r_barrier, bool use_local_
         change.subimage);
     r_barrier.image_memory_barriers = r_barrier.image_memory_barriers.with_new_end(
         command_builder.vk_image_memory_barriers_.size());
-
-#if 0
-    std::cout << __func__ << ": transition layout image=" << change.vk_image
-              << ", layer=" << change.subimage.layer_base
-              << ", count=" << change.subimage.layer_count
-              << ", from_layout=" << to_string(change.vk_image_layout)
-              << ", to_layout=" << to_string(
-                     to_default_image_layout(change.vk_image_aspect, use_local_read))
-              << "\n";
-#endif
   }
 }
 
@@ -1123,7 +951,6 @@ void VKCommandBuilder::ImageTracker::resume(Barrier &r_barrier, bool use_local_r
   }
 
   command_builder.reset_barriers(r_barrier);
-  /* We should be able to do better. BOTTOM/TOP is really a worst case barrier. */
   r_barrier.src_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
   r_barrier.dst_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
   int64_t start_index = command_builder.vk_image_memory_barriers_.size();
@@ -1143,21 +970,8 @@ void VKCommandBuilder::ImageTracker::resume(Barrier &r_barrier, bool use_local_r
         change.vk_image_layout,
         change.vk_image_aspect,
         change.subimage);
-#if 0
-    std::cout << __func__ << ": transition layout image=" << change.vk_image
-              << ", layer=" << change.subimage.layer_base
-              << ", count=" << change.subimage.layer_count
-              << ", from_layout=" << to_string(
-                     to_default_image_layout(change.vk_image_aspect, use_local_read))
-              << ", to_layout=" << to_string(change.vk_image_layout) << "\n";
-#endif
   }
 }
-/** \} */
-
-/* -------------------------------------------------------------------- */
-/** \name Debugging tools
- * \{ */
 
 std::string VKCommandBuilder::to_string_barrier(const Barrier &barrier)
 {
@@ -1185,7 +999,5 @@ std::string VKCommandBuilder::to_string_barrier(const Barrier &barrier)
 
   return ss.str();
 }
-
-/** \} */
 
 }  // namespace blender::gpu::render_graph
