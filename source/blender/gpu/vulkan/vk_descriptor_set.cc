@@ -231,8 +231,8 @@ void VKDescriptorSetTracker::update_resource_access_info_binding_input_attachmen
   if (vk_image != VK_NULL_HANDLE) {
     VKSubImageRange subimage = {};
     if (texture->is_texture_view()) {
-      IndexRange layer_range = texture.layer_range();
-      IndexRange mipmap_range = texture.mip_map_range();
+      IndexRange layer_range = texture->layer_range();
+      IndexRange mipmap_range = texture->mip_map_range();
       subimage = {uint32_t(mipmap_range.start()),
                   uint32_t(mipmap_range.size()),
                   uint32_t(layer_range.start()),
