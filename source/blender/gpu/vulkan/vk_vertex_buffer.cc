@@ -55,6 +55,9 @@ void VKVertexBuffer::ensure_buffer_view()
   if (vk_buffer_view_ != VK_NULL_HANDLE) {
     return;
   }
+  if (buffer_.vk_handle() == VK_NULL_HANDLE || buffer_.size_in_bytes() == 0) {
+    return;
+  }
 
   VkBufferViewCreateInfo buffer_view_info = {};
   buffer_view_info.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
@@ -83,6 +86,7 @@ void VKVertexBuffer::update_sub(uint start_offset, uint data_size_in_bytes, cons
                  "Out of bound write to vertex buffer");
   if (buffer_.is_mapped()) {
     buffer_.update_sub_immediately(start_offset, data_size_in_bytes, data);
+    buffer_.flush();
   }
   else {
     VKContext &context = *VKContext::get();
@@ -177,6 +181,7 @@ void VKVertexBuffer::release_data()
 void VKVertexBuffer::upload_data_direct(const VKBuffer &host_buffer)
 {
   host_buffer.update_immediately(data_);
+  host_buffer.flush();
 }
 
 void VKVertexBuffer::upload_data_via_staging_buffer(VKContext &context)
