@@ -92,10 +92,12 @@ void VKWorkarounds::log() const
             "Activated workarounds\n"
             " - [%c] Not 16/32 bit aligned image formats\n"
             " - [%c] No texture pool\n"
-            " - [%c] Compute pipeline fallback",
+            " - [%c] Compute pipeline fallback\n"
+            " - [%c] Clear depth/stencil via image",
             not_aligned_pixel_formats ? 'X' : ' ',
             GCaps.texture_pool_workaround ? 'X' : ' ',
-            compute_pipeline_fallback ? 'X' : ' ');
+            compute_pipeline_fallback ? 'X' : ' ',
+            clear_depth_stencil_via_image ? 'X' : ' ');
 }
 
 void VKDevice::reinit()

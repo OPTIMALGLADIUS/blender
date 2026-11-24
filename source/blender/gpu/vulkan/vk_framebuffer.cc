@@ -210,11 +210,12 @@ void VKFrameBuffer::clear(const GPUFrameBufferBits buffers,
 
     /* Clearing depth via #vkCmdClearAttachments requires a render pass with write depth or stencil
      * enabled. When not enabled, clearing should be done via texture directly. */
-    /* WORKAROUND: Clearing depth attachment when using dynamic rendering are not working on AMD
-     * official drivers.
-     * See #129265 */
+    /* WORKAROUND: Clearing the depth attachment when using dynamic rendering is not working on
+     * AMD official drivers (see #129265) and on ARM Mali drivers, where the clear is silently
+     * dropped and the previous frame's depth/stencil survives. */
     if ((context.state_manager_get().state.write_mask & needed_mask) == needed_mask &&
-        !GPU_type_matches(GPU_DEVICE_ATI, GPU_OS_ANY, GPU_DRIVER_OFFICIAL))
+        !GPU_type_matches(GPU_DEVICE_ATI, GPU_OS_ANY, GPU_DRIVER_OFFICIAL) &&
+        !VKBackend::get().device.workarounds_get().clear_depth_stencil_via_image)
     {
       build_clear_attachments_depth_stencil(
           buffers, clear_depth, clear_stencil, clear_attachments);

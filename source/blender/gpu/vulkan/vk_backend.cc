@@ -13,13 +13,15 @@
 #include <sstream>
 #include <string>
 
+#if defined(WITH_ADRENOTOOLS) || defined(__ANDROID__)
+#  include <cstdlib>
+#  include <sys/system_properties.h>
+#endif
 #ifdef WITH_ADRENOTOOLS
 #  include <adrenotools/driver.h>
 #  include <android/log.h>
-#  include <cstdlib>
 #  include <dlfcn.h>
 #  include <string>
-#  include <sys/system_properties.h>
 #  include <unistd.h>
 #endif
 
@@ -630,6 +632,28 @@ void VKBackend::platform_init(const VKDevice &device)
             VK_API_VERSION_PATCH(device.vk_physical_device_properties_.apiVersion));
 }
 
+/**
+ * Read a boolean override for a driver workaround from an Android system property, so a device
+ * build can be A/B tested without a rebuild:
+ *
+ *   adb shell setprop debug.blender.<name> 0
+ *
+ * The property is read once per process. Outside Android, or when the property is unset, the
+ * default is used.
+ */
+static bool workaround_override(const char *property, bool default_value)
+{
+#ifdef __ANDROID__
+  char value[PROP_VALUE_MAX] = {};
+  if (__system_property_get(property, value) > 0 && value[0] != '\0') {
+    return atoi(value) != 0;
+  }
+#else
+  (void)property;
+#endif
+  return default_value;
+}
+
 void VKBackend::detect_workarounds(VKDevice &device)
 {
   VKWorkarounds workarounds;
@@ -718,6 +742,35 @@ void VKBackend::detect_workarounds(VKDevice &device)
 #else
   extensions.external_memory = false;
 #endif
+
+  /* ARM Mali workarounds. The driver reports vendor ID 0x13B5 (it does not map onto one of the
+   * GPUDeviceType values, so this has to match the raw vendor ID). Each workaround has a system
+   * property override so a device can be compared against stock behaviour without a rebuild:
+   *   setprop debug.blender.clear_depth_via_image 0
+   *   setprop debug.blender.bresenham_lines 1
+   */
+  const bool is_arm_mali = device.physical_device_properties_get().vendorID == 0x13b5;
+  if (is_arm_mali) {
+    /* `vkCmdClearAttachments` is accepted for a depth/stencil attachment inside a dynamic
+     * rendering scope but does not clear it, so the viewport depth buffer keeps the previous
+     * frame's values. Near faces are then rejected against stale depth, which shows up as the
+     * inside of closed meshes leaking through, as chunks disappearing while navigating and,
+     * because the rejected pixels change with the TAA jitter, as a cube that flickers between
+     * solid and see-through on a static view.
+     *
+     * The clear only takes the `vkCmdClearAttachments` path when the last pass drawn happened to
+     * leave both depth and stencil writes enabled, so which of the two paths is used depends on
+     * the pass that ended the previous frame. Clearing through the image removes that dependency
+     * and always clears. */
+    workarounds.clear_depth_stencil_via_image = workaround_override(
+        "debug.blender.clear_depth_via_image", true);
+    /* Bresenham line rasterization is requested for every line pipeline. Mali's implementation
+     * produces stray segments across the viewport, which matches the line noise seen while
+     * orbiting. Fall back to the default (non-Bresenham) rasterization. */
+    if (!workaround_override("debug.blender.bresenham_lines", false)) {
+      extensions.line_rasterization = false;
+    }
+  }
 
   /* AMD GPUs don't support texture formats that use are aligned to 24 or 48 bits. */
   if (GPU_type_matches(GPU_DEVICE_ATI, GPU_OS_ANY, GPU_DRIVER_ANY) ||

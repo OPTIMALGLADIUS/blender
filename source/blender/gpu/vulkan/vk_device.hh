@@ -178,6 +178,19 @@ struct VKWorkarounds {
    */
   bool compute_pipeline_fallback = false;
 
+  /**
+   * Clear depth/stencil through `vkCmdClearDepthStencilImage` instead of
+   * `vkCmdClearAttachments`.
+   *
+   * `vkCmdClearAttachments` is allowed inside a dynamic rendering scope, but some drivers
+   * (AMD official and ARM's Mali) silently drop the depth/stencil clear there. The
+   * attachment then keeps the depth/stencil of the previous frame, so the next frame's
+   * geometry fails the depth test against its own stale fragments. On a static view that
+   * shows up as missing/inside-out faces that change between frames; while navigating it
+   * shows up as chunks of geometry disappearing.
+   */
+  bool clear_depth_stencil_via_image = false;
+
   /** Log enabled workarounds. */
   void log() const;
 };
