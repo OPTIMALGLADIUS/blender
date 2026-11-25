@@ -1637,7 +1637,9 @@ endif()
 # - WIN32
 # - APPLE
 
-if((UNIX AND NOT APPLE) OR ANDROID)
+if(ANDROID)
+  include(build_files/cmake/platform/platform_android.cmake)
+elseif(UNIX AND NOT APPLE)
   include(build_files/cmake/platform/platform_unix.cmake)
 elseif(WIN32)
   include(build_files/cmake/platform/platform_win32.cmake)
