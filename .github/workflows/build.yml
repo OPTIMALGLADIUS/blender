@@ -142,20 +142,9 @@ jobs:
                  ../blender_build_android/build_host_tools_full \
                  ../blender_build_android/android_apk_stage_full
 
-      - name: Build blender_lite.apk
-        run: |
-          ./build_files/android/build_apk.sh lite
-          test -f ../blender_build_android/android_apk_stage_lite/blender-lite.apk
-          cp ../blender_build_android/android_apk_stage_lite/blender-lite.apk artifacts/blender_lite.apk
-          rm -rf ../blender_build_android/build_android_lite \
-                 ../blender_build_android/build_host_tools_lite \
-                 ../blender_build_android/android_apk_stage_lite
-
-      - name: Upload APK artifacts
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: blender-android-apks-${{ github.sha }}
-          path: |
-            artifacts/blender_full.apk
-            artifacts/blender_lite.apk
+          path: artifacts/blender_full.apk
           if-no-files-found: error
