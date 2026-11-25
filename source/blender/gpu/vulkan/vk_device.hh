@@ -192,6 +192,19 @@ struct VKWorkarounds {
    */
   bool missing_srgb_clear_conversion = false;
 
+  /**
+   * Clear depth/stencil through `vkCmdClearDepthStencilImage` instead of
+   * `vkCmdClearAttachments`.
+   *
+   * `vkCmdClearAttachments` is allowed inside a dynamic rendering scope, but some drivers
+   * (AMD official and ARM's Mali) silently drop the depth/stencil clear there. The attachment
+   * then keeps the depth/stencil of the previous frame, so the next frame's geometry fails the
+   * depth test against its own stale fragments.
+   *
+   * Set `debug.blender.clear_depth_via_image` to 0 to use the clear attachment path instead.
+   */
+  bool clear_depth_stencil_via_image = false;
+
   /** Log enabled workarounds. */
   void log() const;
 };

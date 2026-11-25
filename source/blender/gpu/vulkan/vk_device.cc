@@ -94,12 +94,14 @@ void VKWorkarounds::log() const
             " - [%c] Static viewport & scissor state\n"
             " - [%c] No texture pool\n"
             " - [%c] Missing sRGB clear conversions\n"
-            " - [%c] Compute pipeline fallback",
+            " - [%c] Compute pipeline fallback\n"
+            " - [%c] Clear depth/stencil via image",
             not_aligned_pixel_formats ? 'X' : ' ',
             static_viewport_scissor ? 'X' : ' ',
             GCaps.texture_pool_workaround ? 'X' : ' ',
             missing_srgb_clear_conversion ? 'X' : ' ',
-            compute_pipeline_fallback ? 'X' : ' ');
+            compute_pipeline_fallback ? 'X' : ' ',
+            clear_depth_stencil_via_image ? 'X' : ' ');
 }
 
 void VKDevice::reinit()
