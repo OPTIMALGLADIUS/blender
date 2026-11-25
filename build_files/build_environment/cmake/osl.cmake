@@ -54,7 +54,7 @@ set(OSL_EXTRA_ARGS
   -Dlibdeflate_DIR=${LIBDIR}/deflate/lib/cmake/libdeflate
 )
 
-if(NOT (APPLE OR BLENDER_PLATFORM_WINDOWS_ARM OR CMAKE_CROSSCOMPILING))
+if(NOT (APPLE OR CMAKE_CROSSCOMPILING))
   list(APPEND OSL_EXTRA_ARGS
     -DOSL_USE_OPTIX=ON
     -DCUDA_TARGET_ARCH=sm_50
@@ -121,6 +121,8 @@ set(LLVM_LIBRARIES "${_osl_llvm_libs}" CACHE STRING "" FORCE)
       ${PATCH_DIR}/osl_crosscompile_host_oslc.diff
   )
 
+  # NOTE: Purposefully use ${HOST_DEPS_BUILD_DIR} here to access the host deps *build* directory instead of its
+  #       pre-harvest install directory.
   set(OSL_GENLUTS_PATH ${HOST_DEPS_BUILD_DIR}/build/osl/src/external_osl-build/bin/genluts)
   set(OSL_OSLC_PATH ${HOST_LIBDIR}/osl/bin/oslc)
   if(NOT EXISTS ${OSL_GENLUTS_PATH})
@@ -180,7 +182,7 @@ if(WIN32)
     external_osl
     external_flexbison
   )
-elseif(UNIX AND NOT APPLE)
+elseif(UNIX AND NOT APPLE AND NOT CMAKE_CROSSCOMPILING)
   add_dependencies(
     external_osl
     external_flex

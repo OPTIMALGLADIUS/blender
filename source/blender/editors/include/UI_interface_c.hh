@@ -407,6 +407,8 @@ enum ButtonFlag : int64_t {
    * buttons currently.
    */
   BUT_FORCE_SEMI_MODAL_ACTIVE = int64_t(1) << 33,
+  /** On a full Tab auto-complete match, apply the value & keep editing (cursor at the end). */
+  BUT_TEXTEDIT_AUTOCOMPLETE_KEEP_ACTIVE = int64_t(1) << 34,
 };
 
 /** #Button.dragflag */
@@ -876,6 +878,10 @@ bool block_is_empty_ex(const Block *block, bool skip_title);
 bool block_is_empty(const Block *block);
 bool block_can_add_separator(const Block *block);
 /**
+ * Return the first default button (activated by "Return") or null.
+ */
+const Button *block_active_default_button_find(const Block *block);
+/**
  * Return true when the block has a default button.
  * Use this for popups to detect when pressing "Return" will run an action.
  */
@@ -919,8 +925,10 @@ bool popup_menu_end_or_cancel(bContext *C, PopupMenu *pup);
 Layout *popup_menu_layout(PopupMenu *pup);
 
 void popup_menu_reports(bContext *C, ReportList *reports) ATTR_NONNULL();
-wmOperatorStatus popup_menu_invoke(bContext *C, const char *idname, ReportList *reports)
-    ATTR_NONNULL(1, 2);
+wmOperatorStatus popup_menu_invoke(bContext *C,
+                                   const char *idname,
+                                   ReportList *reports,
+                                   const int anchor_xy[2] = nullptr) ATTR_NONNULL(1, 2);
 
 /**
  * If \a block is displayed in a popup menu, tag it for closing.
@@ -933,6 +941,9 @@ void popup_menu_close(const Block *block, bool is_cancel = false);
  * block. Convenience since the block may not be available.
  */
 void popup_menu_close_from_but(const Button *but, bool is_cancel = false);
+
+/** Close an open menu by its type identifier, returning whether it was found. */
+bool popup_menu_close_by_name(bContext *C, wmWindow *win, const char *idname);
 
 /**
  * Allow setting menu return value from externals.
@@ -1063,6 +1074,8 @@ void popup_block_close(bContext *C, wmWindow *win, Block *block);
 
 bool popup_block_name_exists(const bScreen *screen, StringRef name);
 
+bool popup_region_from_operator(const bScreen *screen, const ARegion *region);
+
 /* Blocks
  *
  * Functions for creating, drawing and freeing blocks. A Block is a
@@ -1148,6 +1161,7 @@ void blocklist_free_inactive(const bContext *C, ARegion *region);
  */
 void UI_screen_free_active_but_highlight(const bContext *C, bScreen *screen);
 void UI_region_free_active_but_all(bContext *C, ARegion *region);
+void UI_region_clear_hover(const bContext *C, ARegion *region);
 
 void block_region_set(Block *block, ARegion *region);
 
@@ -1259,11 +1273,6 @@ const ColorManagedDisplay *button_cm_display_get(Button &but);
  * Set at hint that describes the expected value when empty.
  */
 void button_placeholder_set(Button *but, StringRef placeholder_text);
-
-/**
- * Unselect any text selection in the button's text field.
- */
-void button_clear_selection(Button *but);
 
 /**
  * Special button case, only draw it when used actively, for outliner etc.
@@ -2124,7 +2133,7 @@ void button_tooltip_timer_remove(bContext *C, Button *but);
 
 /**
  * Attempt to activate an button referencing an RNA property in the \a region.
- * \param block_name: targets a block in the \a region, if \a block_name is not set it will test
+ * \param block: targets a block in the \a region, when not passed it will test
  * any block in the \a region.
  * \returns `true` if the button gets activated.
  */
@@ -2560,6 +2569,30 @@ void template_search_preview(Layout *layout,
                              int rows,
                              int cols,
                              std::optional<StringRef> text = std::nullopt);
+
+/**
+ * Create a filepath with filebrowser button, similar to the default layout generated for this type
+ * of string property by `Layout::prop()`, but with more control.
+ *
+ * \param pathselect_op: If not null, the name of the operator to call (instead of the generic
+ * `BUTTONS_OT_file_browse` or `BUTTONS_OT_directory_browse` ones).
+ * \param filter_glob: If not empty, a 'glob filter' string listing all allowed extensions to list
+ * in the filebrowser, separated by semi-columns (e.g. `*.usd;*.usda;*.usdc;*.usdz`). Only used if
+ * the property sub-type is `PROP_FILEPATH`.
+ * \param name: Label text, the property name is used if unset.
+ * \param placeholder: the placeholder text to show in the text widget, when empty.
+ * \param split_name: Edit the parent directory and file/directory name in separate text fields.
+ */
+void template_filepath(Layout *layout,
+                       const bContext *C,
+                       PointerRNA *ptr,
+                       const StringRefNull propname,
+                       const char *pathselect_op,
+                       const char *filter_glob,
+                       const std::optional<StringRef> name,
+                       const std::optional<StringRef> placeholder,
+                       bool split_name = false);
+
 /**
  * This is creating/editing RNA-Paths
  *
@@ -2813,7 +2846,17 @@ void template_colormanaged_view_settings(Layout *layout,
                                          PointerRNA *ptr,
                                          StringRefNull propname);
 
-int template_recent_files(Layout *layout, int rows);
+enum class RecentFilesFilter : int8_t {
+  All,
+  Project, /**< Files in the active project. */
+  Other,   /**< Files not in the active project. */
+};
+int template_recent_files(Layout *layout,
+                          int rows,
+                          RecentFilesFilter filter = RecentFilesFilter::All,
+                          float project_ratio = 0.5f);
+int template_recent_projects(Layout *layout, int rows);
+void template_project_splash(Layout *layout, bContext *C);
 void template_file_select_path(Layout *layout, bContext *C, FileSelectParams *params);
 
 void template_asset_shelf_popover(
@@ -2824,6 +2867,8 @@ void template_light_linking_collection(
 
 void template_bone_collection_tree(Layout *layout, bContext *C);
 void template_grease_pencil_layer_tree(Layout *layout, bContext *C);
+
+void template_project_asset_libraries_tree(Layout *layout, bContext *C);
 
 void template_tree_interface(Layout *layout, const bContext *C, PointerRNA *ptr);
 /**
@@ -3096,6 +3141,9 @@ ARegion *tooltip_create_from_button_or_extra_icon(bContext *C,
                                                   ButtonExtraOpIcon *extra_icon,
                                                   bool is_quick_tip);
 ARegion *tooltip_create_from_gizmo(bContext *C, wmGizmo *gz);
+ARegion *tooltip_create_from_func(bContext *C,
+                                  FunctionRef<void(TooltipData &data)> create_fn,
+                                  const float init_position[2]);
 
 void tooltip_free(bContext *C, bScreen *screen, ARegion *region);
 
@@ -3112,7 +3160,7 @@ ARegion *tooltip_create_from_search_item_generic(bContext *C,
                                                  ID *id);
 
 /* How long before a tool-tip shows. */
-#define UI_TOOLTIP_DELAY 1.0
+#define UI_TOOLTIP_DELAY 0.5
 #define UI_TOOLTIP_DELAY_QUICK 0.2
 
 /* Float precision helpers */
@@ -3208,6 +3256,11 @@ Button *region_views_find_active_item_but(const ARegion *region);
 void region_views_clear_search_highlight(const ARegion *region);
 
 bool region_panels_fits_only_categories(const ARegion *region);
+/**
+ * Ensures the region is wide enough to draw panels' content.
+ * \return true if the region width changed.
+ */
+bool panel_region_visible_width_ensure(ARegion *region);
 
 void register_scene_compositor_effects_panel(ARegionType *region_type);
 
@@ -3221,8 +3274,8 @@ enum class ActivationButtonState : int8_t {
 /**
  * Attempt to activate an button referencing an RNA property. If any other button in the screen is
  * active, it will be deactivated.
- * \param state: Activation state for the button. Some states are specific to certain button types;
- * when an incompatible state is provided, the button will be activated with the
+ * \param target_state: Activation state for the button. Some states are specific to certain button
+ * types; when an incompatible state is provided, the button will be activated with the
  * #ActivationButtonState::Highlight state.
  * \param index: Index of the button that references the RNA property.
  * \return The center point of the button in window coordinates when successfully activated.

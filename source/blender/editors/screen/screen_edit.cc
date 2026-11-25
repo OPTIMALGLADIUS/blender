@@ -18,6 +18,7 @@
 #include "DNA_userdef_types.h"
 
 #include "BLI_listbase.hh"
+#include "BLI_math_base_c.hh"
 #include "BLI_rect.hh"
 #include "BLI_string_utf8.hh"
 #include "BLI_utildefines.hh"
@@ -1085,7 +1086,11 @@ void ED_screen_set_active_region(bContext *C, wmWindow *win, const int xy[2])
       if (xy[1] > (area_iter->totrct.ymin + BORDERPADDING) &&
           xy[1] < (area_iter->totrct.ymax - BORDERPADDING))
       {
-        if (ED_area_azones_update(area_iter, xy) == nullptr) {
+        if (ED_area_azones_update(area_iter,
+                                  xy,
+                                  win->runtime->cursor_hover_enabled &&
+                                      !win->runtime->cursor_is_touch) == nullptr)
+        {
           area = area_iter;
           break;
         }
@@ -1281,11 +1286,16 @@ static int screen_global_header_size()
 
 static void screen_global_topbar_area_refresh(wmWindow *win, bScreen *screen)
 {
-  const short size = screen_global_header_size();
-  rcti rect;
+  rcti rect, safe_area;
 
   /* Use content rect to account for CSD, converted to inclusive bounds for area geometry. */
   WM_window_rect_calc(win, &rect);
+  WM_window_safe_area_calc(win, &safe_area);
+
+  /* Apply safe-area padding above the topbar. */
+  const int safe_area_top = max_ii(0, rect.ymax - safe_area.ymax);
+  const short size = screen_global_header_size() + int(ceilf(safe_area_top / UI_SCALE_FAC));
+
   rect.xmax -= 1;
   rect.ymin = (rect.ymax - 1) - size;
   rect.ymax -= 1;

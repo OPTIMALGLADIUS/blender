@@ -113,6 +113,7 @@
 #include "wm_event_system.hh"
 #include "wm_event_types.hh"
 #include "wm_files.hh"
+#include "wm_modifier_wheel.hh"
 #include "wm_window.hh"
 
 #ifdef WITH_XR_OPENXR
@@ -587,6 +588,10 @@ static const char *wm_context_member_from_ptr(const bContext *C,
 
               TEST_PTR_DATA_TYPE("space_data.overlay", RNA_View3DOverlay, ptr, v3d);
               TEST_PTR_DATA_TYPE("space_data.shading", RNA_View3DShading, ptr, shading);
+              /* Same region as #rna_SpaceView3D_region_3d_get. */
+              const ARegion *region = CTX_wm_area(C)->regionbase.last();
+              TEST_PTR_DATA_TYPE(
+                  "space_data.region_3d", RNA_RegionView3D, ptr, region->regiondata);
               break;
             }
             case SPACE_GRAPH: {
@@ -1437,7 +1442,7 @@ static ui::Block *wm_block_create_redo(bContext *C, ARegion *region, void *arg_o
                         ui::BLOCK_POPUP);
 
   /* If register is not enabled, the operator gets freed on #OPERATOR_FINISHED
-   * ui_apply_but_funcs_after calls #ED_undo_operator_repeate_cb and crashes. */
+   * ui_apply_but_funcs_after calls #ED_undo_operator_repeat_cb and crashes. */
   BLI_assert(op->type->flag & OPTYPE_REGISTER);
 
   block_func_handle_set(block, wm_block_redo_cb, arg_op);
@@ -1553,15 +1558,15 @@ static ui::Block *wm_block_dialog_create(bContext *C, ARegion *region, void *use
       120 * UI_SCALE_FAC,
       BLF_width(style->widget.uifont_id, data->title.c_str(), BLF_DRAW_STR_DUMMY_MAX));
 
-  /* Break Message into multiple lines. */
-  Vector<std::string> message_lines;
-  StringRef messaged_trimmed = StringRef(data->message).trim();
-  std::istringstream message_stream(messaged_trimmed);
+  /* Widen the dialog to fit message lines, wrapping lines that are longer than the maximum. */
+  const std::string message = StringRef(data->message).trim();
+  const int message_width_max = std::max(data->width, 30 * UI_UNIT_X);
+  std::istringstream message_stream(message);
   std::string line;
   while (std::getline(message_stream, line)) {
-    message_lines.append(line);
-    text_width = std::max(
-        text_width, int(BLF_width(style->widget.uifont_id, line.c_str(), BLF_DRAW_STR_DUMMY_MAX)));
+    const int line_width = BLF_width(
+        style->widget.uifont_id, line.c_str(), BLF_DRAW_STR_DUMMY_MAX);
+    text_width = std::max(text_width, std::min(line_width, message_width_max));
   }
 
   int dialog_width = std::max(text_width + int(style->columnspace * 2.5), data->width);
@@ -1592,19 +1597,14 @@ static ui::Block *wm_block_dialog_create(bContext *C, ARegion *region, void *use
     uiItemL_ex(&layout, data->title, ICON_NONE, true, false);
 
     /* Line under the title if there are properties but no message body. */
-    if (data->include_properties && message_lines.size() == 0) {
+    if (data->include_properties && message.empty()) {
       layout.separator(0.2f, ui::LayoutSeparatorType::Line);
     };
   }
 
-  /* Message lines. */
-  if (message_lines.size() > 0) {
-    ui::Layout &lines = layout.column(false);
-    lines.scale_y_set(0.65f);
-    lines.separator(0.1f);
-    for (auto &st : message_lines) {
-      lines.label(st, ICON_NONE);
-    }
+  if (!message.empty()) {
+    layout.separator(0.1f);
+    layout.label_multiline(message, ICON_NONE);
   }
 
   if (data->include_properties) {
@@ -1632,7 +1632,18 @@ static ui::Block *wm_block_dialog_create(bContext *C, ARegion *region, void *use
     ui::Button *confirm_but;
     ui::Button *cancel_but;
 
-    ui::Layout &split = col.split(0.0f, true);
+    /* Right align buttons in wide dialogs, instead of stretching them. Same width as the
+     * buttons in the unsaved changes dialog. */
+    const int buttons_width_max = std::max(18 * UI_UNIT_X, 3 * longest_button_text);
+    ui::Layout *buttons_layout = &col;
+    if (dialog_width > buttons_width_max) {
+      ui::Layout &buttons_split = col.split(1.0f - float(buttons_width_max) / float(dialog_width),
+                                            false);
+      buttons_split.column(false);
+      buttons_layout = &buttons_split.column(false);
+    }
+
+    ui::Layout &split = buttons_layout->split(0.0f, true);
     split.scale_y_set(small ? 1.0f : 1.2f);
 
     if (windows_layout) {
@@ -1895,7 +1906,7 @@ wmOperatorStatus WM_operator_props_dialog_popup(bContext *C,
   data->confirm_text = confirm_text ? std::move(*confirm_text) : IFACE_("OK");
   data->message = message ? std::move(*message) : std::string();
   data->icon = show_icon ? ui::AlertIcon::Info : ui::AlertIcon::None;
-  data->size = show_icon ? WM_POPUP_SIZE_LARGE : WM_POPUP_SIZE_SMALL;
+  data->size = (show_icon || message) ? WM_POPUP_SIZE_LARGE : WM_POPUP_SIZE_SMALL;
   data->position = (message) ? WM_POPUP_POSITION_CENTER : WM_POPUP_POSITION_MOUSE;
   data->cancel_default = cancel_default;
   data->mouse_move_quit = false;
@@ -2690,6 +2701,7 @@ struct RadialControl {
   gpu::Texture *texture = nullptr;
   ListBaseT<wmPaintCursor> orig_paintcursors = {};
   bool use_secondary_tex = false;
+  bool wait_for_pen = false;
   void *cursor = nullptr;
   NumInput num_input = {};
   int init_event = 0;
@@ -2913,6 +2925,9 @@ static void radial_control_paint_cursor(bContext *C,
                                         void *customdata)
 {
   RadialControl *rc = static_cast<RadialControl *>(customdata);
+  if (rc->wait_for_pen) {
+    return;
+  }
   const uiStyle *style = ui::style_get();
   const uiFontStyle *fstyle = &style->widget;
   const int fontid = fstyle->uifont_id;
@@ -3376,6 +3391,7 @@ static wmOperatorStatus radial_control_invoke(bContext *C, wmOperator *op, const
   }
 
   rc->current_value = rc->initial_value;
+  rc->wait_for_pen = RNA_boolean_get(op->ptr, "use_pen");
   radial_control_set_initial_mouse(rc, event);
   radial_control_set_tex(rc);
 
@@ -3444,6 +3460,20 @@ static void radial_control_cancel(bContext *C, wmOperator *op)
 static wmOperatorStatus radial_control_modal(bContext *C, wmOperator *op, const wmEvent *event)
 {
   RadialControl *rc = static_cast<RadialControl *>(op->customdata);
+  if (RNA_boolean_get(op->ptr, "use_pen") && ISMOUSE(event->type)) {
+    if (!WM_event_is_tablet(event) || (event->flag & WM_EVENT_CURSOR_REFRESH)) {
+      return OPERATOR_RUNNING_MODAL;
+    }
+    /* Ignore the menu selection's release and wait for a new press after positioning. */
+    if (ISMOUSE_BUTTON(event->type) && (event->val != KM_PRESS || rc->wait_for_pen)) {
+      return OPERATOR_RUNNING_MODAL;
+    }
+  }
+  if (rc->wait_for_pen && event->type == MOUSEMOVE) {
+    /* Menu selection may use touch. Place the control at the first pen position instead. */
+    radial_control_set_initial_mouse(rc, event);
+    rc->wait_for_pen = false;
+  }
   float new_value, dist = 0.0f, zoom[2];
   float delta[2];
   wmOperatorStatus ret = OPERATOR_RUNNING_MODAL;
@@ -3792,6 +3822,13 @@ static void WM_OT_radial_control(wmOperatorType *ot)
 
   prop = RNA_def_boolean(
       ot->srna, "release_confirm", false, "Confirm On Release", "Finish operation on key release");
+  RNA_def_property_flag(prop, PROP_SKIP_SAVE);
+
+  prop = RNA_def_boolean(ot->srna,
+                         "use_pen",
+                         false,
+                         "Use Pen",
+                         "Use pen input, placing the control at the first pen movement");
   RNA_def_property_flag(prop, PROP_SKIP_SAVE);
 }
 
@@ -4385,6 +4422,7 @@ static void WM_OT_stereo3d_set(wmOperatorType *ot)
 
 void wm_operatortypes_register()
 {
+  WM_operatortype_append(WM_OT_modifier_wheel_toggle);
   WM_operatortype_append(WM_OT_window_close);
   WM_operatortype_append(WM_OT_window_new);
   WM_operatortype_append(WM_OT_window_new_main);
@@ -4414,6 +4452,7 @@ void wm_operatortypes_register()
   WM_operatortype_append(WM_OT_save_as_mainfile);
   WM_operatortype_append(WM_OT_save_mainfile);
   WM_operatortype_append(WM_OT_clear_recent_files);
+  WM_operatortype_append(WM_OT_clear_recent_projects);
   WM_operatortype_append(WM_OT_redraw_timer);
   WM_operatortype_append(WM_OT_memory_statistics);
   WM_operatortype_append(WM_OT_debug_menu);

@@ -10,13 +10,35 @@ if(NOT WITH_LIBS_PRECOMPILED)
   unset(LIBDIR)
 else()
   if(NOT DEFINED LIBDIR AND ANDROID)
-    set(LIBDIR_ANDROID ${CMAKE_SOURCE_DIR}/lib/android_arm64)
+    # Map the Android ABI onto Blender's own architecture naming conventions,
+    # matching the directory the dependency builder harvests into.
+    if(ANDROID_ABI STREQUAL "arm64-v8a")
+      set(LIBDIR_ANDROID ${CMAKE_SOURCE_DIR}/lib/android_arm64)
+    elseif(ANDROID_ABI STREQUAL "x86_64")
+      set(LIBDIR_ANDROID ${CMAKE_SOURCE_DIR}/lib/android_x64)
+    else()
+      message(FATAL_ERROR "Unsupported Android ABI \"${ANDROID_ABI}\".")
+    endif()
 
-    file(GLOB LIBDIR_RESULT ${ANDROID_LIBDIR}/*)
+    file(GLOB LIBDIR_RESULT ${LIBDIR_ANDROID}/*)
     list(LENGTH LIBDIR_RESULT LIBDIR_LEN)
 
     if(NOT LIBDIR_LEN EQUAL 0)
       set(LIBDIR ${LIBDIR_ANDROID})
+      # Dependencies added in 5.3 that the Android libraries do not ship yet. Precompiled
+      # libraries make them required, so turn the features off until the libraries appear.
+      foreach(_lib_option jolt:WITH_JOLT opentimelineio:WITH_OPENTIMELINEIO ktx:WITH_KTX)
+        string(REPLACE ":" ";" _lib_option "${_lib_option}")
+        list(GET _lib_option 0 _lib)
+        list(GET _lib_option 1 _option)
+        if(${_option} AND NOT EXISTS ${LIBDIR}/${_lib})
+          message(STATUS "${LIBDIR}/${_lib} not found, disabling ${_option}")
+          set(${_option} OFF CACHE BOOL "" FORCE)
+        endif()
+      endforeach()
+      unset(_lib_option)
+      unset(_lib)
+      unset(_option)
     else()
       message(STATUS
         "Library directory \"${LIBDIR_ANDROID}\" is empty or does not exist."
@@ -130,6 +152,7 @@ if(DEFINED LIBDIR)
   set(Eigen3_ROOT ${LIBDIR}/eigen)
   set(meshoptimizer_ROOT ${LIBDIR}/meshoptimizer)
   set(draco_ROOT ${LIBDIR}/draco)
+  set(Ktx_ROOT ${LIBDIR}/ktx)
 endif()
 
 # Wrapper to prefer static libraries
@@ -168,7 +191,12 @@ endif()
 
 if(WITH_VULKAN_BACKEND)
   if(DEFINED LIBDIR)
-    if(NOT ANDROID)  # Android provides its own Vulkan Loader
+    if(ANDROID)
+      # Android provides its own Vulkan Loader, however we still require SPIR-V headers
+      # for shader name injection (since PR !162006). Manually set Vulkan include dirs
+      # in this sense, only contains SPIR-V headers on Android.
+      set(VULKAN_INCLUDE_DIRS "${LIBDIR}/vulkan/include")
+    else()
       if(NOT EXISTS "${LIBDIR}/vulkan")
         message(FATAL_ERROR "${LIBDIR}/vulkan is missing!")
       endif()
@@ -317,7 +345,7 @@ if(WITH_OPENAL)
 
   if(ANDROID AND OPENAL_FOUND)
     # Android NDK OpenSL ES library required by OpenAL
-    list(APPEND PLATFORM_LINKLIBS -lopensles)
+    list(APPEND PLATFORM_LINKLIBS -lOpenSLES)
   endif()
 endif()
 
@@ -504,7 +532,30 @@ if(WITH_EMBREE)
 endif()
 add_bundled_libraries(embree/lib)
 
-if(WITH_OPENIMAGEDENOISE)
+if(ANDROID AND WITH_OPENIMAGEDENOISE)
+  # The prebuilt OIDN is shared and dlopens its CPU module by a versioned name,
+  # which an APK never installs, so device creation fails. Link the static build
+  # from build_files/android/build_oidn.sh instead; default to its install prefix.
+  get_filename_component(_oidn_default_root
+    "${CMAKE_SOURCE_DIR}/../blender_build_android/oidn-deps/install-2.5.0" ABSOLUTE)
+  if(NOT ANDROID_OIDN_ROOT AND EXISTS "${_oidn_default_root}/lib/libOpenImageDenoise.a")
+    set(ANDROID_OIDN_ROOT "${_oidn_default_root}" CACHE PATH "Static OpenImageDenoise install")
+  endif()
+  unset(_oidn_default_root)
+endif()
+
+if(WITH_OPENIMAGEDENOISE AND ANDROID AND ANDROID_OIDN_ROOT)
+  # The static build is split across archives whose link order matters; its own
+  # CMake package encodes that graph and pulls in TBB. find_package re-roots
+  # under LIBDIR where the shared package would win, so name the directory.
+  file(GLOB _oidn_package_dir "${ANDROID_OIDN_ROOT}/lib/cmake/OpenImageDenoise*")
+  set(OpenImageDenoise_DIR ${_oidn_package_dir} CACHE PATH "" FORCE)
+  unset(_oidn_package_dir)
+  find_package(OpenImageDenoise CONFIG REQUIRED)
+  set(OPENIMAGEDENOISE_INCLUDE_DIRS ${ANDROID_OIDN_ROOT}/include)
+  set(OPENIMAGEDENOISE_LIBRARIES OpenImageDenoise)
+  set(OPENIMAGEDENOISE_FOUND ON)
+elseif(WITH_OPENIMAGEDENOISE)
   find_package_wrapper(OpenImageDenoise)
   set_and_warn_library_found("OpenImageDenoise" OPENIMAGEDENOISE_FOUND WITH_OPENIMAGEDENOISE)
   add_bundled_libraries(openimagedenoise/lib)
@@ -620,12 +671,43 @@ if(WITH_CYCLES AND WITH_CYCLES_PATH_GUIDING)
 endif()
 
 if(WITH_TRACY)
-  if(DEFINED LIBDIR)
-    set(Tracy_ROOT_DIR ${LIBDIR}/tracy)
-  endif()
   find_package_wrapper(Tracy REQUIRED)
   mark_as_advanced(Tracy_DIR)
 endif()
+
+if(WITH_JOLT)
+  if(WITH_LIBS_PRECOMPILED OR WITH_STRICT_BUILD_OPTIONS)
+    find_package_wrapper(Jolt REQUIRED)
+  else()
+    # This isn't a common system library, so disable if it's not found.
+    find_package_wrapper(Jolt)
+    if(TARGET Jolt::Jolt)
+      set(JOLT_FOUND TRUE)
+    endif()
+    set_and_warn_library_found("Jolt" JOLT_FOUND WITH_JOLT)
+  endif()
+  if(DEFINED Jolt_DIR)
+    mark_as_advanced(Jolt_DIR)
+  endif()
+endif()
+add_bundled_libraries(jolt/lib)
+
+if(WITH_OPENTIMELINEIO)
+  if(WITH_LIBS_PRECOMPILED OR WITH_STRICT_BUILD_OPTIONS)
+    find_package_wrapper(OpenTimelineIO REQUIRED)
+  else()
+    # This isn't a common system library, so disable if it's not found.
+    find_package_wrapper(OpenTimelineIO)
+    if(TARGET OTIO::opentimelineio)
+      set(OPENTIMELINEIO_FOUND TRUE)
+    endif()
+    set_and_warn_library_found("OpenTimelineIO" OPENTIMELINEIO_FOUND WITH_OPENTIMELINEIO)
+  endif()
+  if(DEFINED OpenTimelineIO_DIR)
+    mark_as_advanced(OpenTimelineIO_DIR)
+  endif()
+endif()
+add_bundled_libraries(opentimelineio/lib)
 
 if(DEFINED LIBDIR)
   without_system_libs_end()
@@ -737,6 +819,23 @@ if(WITH_MESHOPTIMIZER)
   endif()
 endif()
 add_bundled_libraries(meshoptimizer/lib)
+
+if(WITH_KTX)
+  if(WITH_LIBS_PRECOMPILED OR WITH_STRICT_BUILD_OPTIONS)
+    find_package_wrapper(Ktx REQUIRED)
+  else()
+    # This isn't a common system library, so disable if it's not found.
+    find_package_wrapper(Ktx)
+    if(TARGET KTX::ktx)
+      set(KTX_FOUND TRUE)
+    endif()
+    set_and_warn_library_found("KTX" KTX_FOUND WITH_KTX)
+  endif()
+  if(DEFINED Ktx_DIR)
+    mark_as_advanced(Ktx_DIR)
+  endif()
+endif()
+add_bundled_libraries(ktx/lib)
 
 # Jack is intended to use the system library.
 if(WITH_JACK)
@@ -1089,7 +1188,7 @@ unset(_IS_LINKER_DEFAULT)
 # Avoid conflicts with Mesa llvmpipe, Luxrender, and other plug-ins that may
 # use the same libraries as Blender with a different version or build options.
 set(PLATFORM_SYMBOLS_MAP ${CMAKE_SOURCE_DIR}/source/creator/symbols_unix.map)
-set(PLATFORM_LINKFLAGS_SYMBOL_HIDING "-Wl,--version-script='${PLATFORM_SYMBOLS_MAP}'")
+set(PLATFORM_LINKFLAGS_SYMBOL_HIDING "-Wl,--version-script=\"${PLATFORM_SYMBOLS_MAP}\"")
 
 # Don't use position independent executable for portable install since file
 # browsers can't properly detect blender as an executable then. Still enabled

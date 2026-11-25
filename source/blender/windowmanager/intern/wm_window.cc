@@ -47,6 +47,7 @@
 
 #include "BLT_translation.hh"
 
+#include "BKE_autoexec.hh"
 #include "BKE_blender_version.h"
 #include "BKE_context.hh"
 #include "BKE_global.hh"
@@ -71,6 +72,7 @@
 #include "wm_draw.hh"
 #include "wm_event_system.hh"
 #include "wm_files.hh"
+#include "wm_modifier_wheel.hh"
 #include "wm_window.hh"
 #include "wm_window_private.hh"
 #ifdef WITH_XR_OPENXR
@@ -561,6 +563,15 @@ void wm_window_close(bContext *C, wmWindowManager *wm, wmWindow *win)
   WM_main_add_notifier(NC_WINDOW | NA_REMOVED, nullptr);
 }
 
+/** If a project is active, append its name to `win_title`. */
+static void wm_window_title_project_append(fmt::memory_buffer &win_title)
+{
+  if (const bke::BlenderProject *project = BKE_blender_project_get(G_MAIN)) {
+    win_title.append(StringRef(" - "));
+    win_title.append(project->get_name());
+  }
+}
+
 /**
  * Construct the title text for `win`.
  * The window may *not* have been created, any calls depending on `win->runtime->ghostwin` are
@@ -583,6 +594,11 @@ static void wm_window_title_text(wmWindowManager *wm,
     ScrArea *area = (screen) ? screen->areabase.first() : nullptr;
     if (is_single && area && area->spacetype != SPACE_EMPTY) {
       win_title.append(StringRef(IFACE_(ED_area_name(area).c_str())));
+
+      /* Append the project name to the Project Settings editor. */
+      if (area->spacetype == SPACE_PROJECT) {
+        wm_window_title_project_append(win_title);
+      }
     }
     else {
       win_title.append(StringRef("Blender"));
@@ -677,10 +693,7 @@ static void wm_window_title_text(wmWindowManager *wm,
   }
 
   /* If a project is active, display its name. */
-  if (const bke::BlenderProject *project = BKE_blender_project_get(G_MAIN)) {
-    win_title.append(StringRef(" - "));
-    win_title.append(project->get_name());
-  }
+  wm_window_title_project_append(win_title);
 
   win_title.append(StringRef(" — Blender "));
   win_title.append(StringRef(BKE_blender_version_string()));
@@ -886,7 +899,7 @@ static void wm_window_update_eventstate_modifiers(wmWindowManager *wm,
       wm_ghost_modifier_query(MOD_SIDE_RIGHT),
   };
   const uint8_t keymodifier = keymodifier_sided[0] | keymodifier_sided[1];
-  const uint8_t keymodifier_eventstate = win->runtime->eventstate->modifier;
+  const uint8_t keymodifier_eventstate = win->runtime->physical_modifiers;
   if (keymodifier != keymodifier_eventstate) {
     GHOST_TEventKeyData kdata{};
     kdata.key = GHOST_kKeyUnknown;
@@ -1005,6 +1018,9 @@ static void wm_window_ghostwindow_add(wmWindowManager *wm,
   if (G.debug & G_DEBUG_GPU) {
     gpu_settings.flags |= GHOST_gpuDebugContext;
   }
+  if (G.debug & G_DEBUG_GPU_NO_HW_RAYTRACING) {
+    gpu_settings.flags |= GHOST_gpuNoHWRaytracing;
+  }
 
   GPUBackendType gpu_backend = GPU_backend_type_selection_get();
   gpu_settings.context_type = wm_ghost_drawing_context_type(gpu_backend);
@@ -1055,6 +1071,7 @@ static void wm_window_ghostwindow_add(wmWindowManager *wm,
     ghost_window->setUserData(win); /* Pointer back. */
 
     wm_window_ensure_eventstate(win);
+    wm_modifier_wheel_init(win);
 
     /* Store actual window size in blender window. */
     /* WIN32: gives undefined window size when minimized. */
@@ -1816,6 +1833,14 @@ static bool ghost_event_proc(const GHOST_IEvent *ghost_event, GHOST_TUserDataPtr
     return true;
   }
 
+  if (type == GHOST_kEventApplicationWillEnterBackground) {
+    /* The OS may now kill the process without notice; keep "Recover Last Session" usable. */
+    if (wm->init_flag & WM_INIT_FLAG_WINDOW) {
+      wm_quit_file_write(C);
+    }
+    return true;
+  }
+
   GHOST_TEventDataPtr data = ghost_event->getData();
   const uint64_t event_time_ms = ghost_event->getTime();
 
@@ -1845,9 +1870,13 @@ static bool ghost_event_proc(const GHOST_IEvent *ghost_event, GHOST_TUserDataPtr
   if (wm_virtual_keyboard_ghost_event(wm, win, type, data)) {
     return true;
   }
+  if (wm_modifier_wheel_event(wm, win, type, data, event_time_ms)) {
+    return true;
+  }
 
   switch (type) {
     case GHOST_kEventWindowDeactivate: {
+      wm_modifier_wheel_release(win, event_time_ms);
       wm_window_update_eventstate_modifiers_clear(wm, win, event_time_ms);
 
       wm_event_add_ghostevent(wm, win, type, data, event_time_ms);
@@ -1888,7 +1917,7 @@ static bool ghost_event_proc(const GHOST_IEvent *ghost_event, GHOST_TUserDataPtr
       event.type = MOUSEMOVE;
       event.val = KM_NOTHING;
       copy_v2_v2_int(event.prev_xy, event.xy);
-      event.flag = eWM_EventFlag(0);
+      event.flag = WM_EVENT_CURSOR_REFRESH;
 
       WM_event_add(win, &event);
 
@@ -2015,6 +2044,15 @@ static bool ghost_event_proc(const GHOST_IEvent *ghost_event, GHOST_TUserDataPtr
         PointerRNA props_ptr = WM_operator_properties_create_ptr(ot);
         RNA_string_set(&props_ptr, "filepath", path);
         RNA_boolean_set(&props_ptr, "display_file_selector", false);
+        /* There is no file selector to show the "Trusted Source" option, use its default. */
+        RNA_boolean_set(&props_ptr,
+                        "use_scripts",
+                        BKE_autoexec_default_trust_source(path,
+                                                          {
+                                                              .skip_overrides = false,
+                                                              .canonicalize = true,
+                                                              .strip_filename = true,
+                                                          }));
         WM_operator_name_call_ptr(C, ot, wm::OpCallContext::InvokeDefault, &props_ptr, nullptr);
         WM_operator_properties_free(&props_ptr);
 
@@ -3209,6 +3247,26 @@ void WM_window_rect_calc(const wmWindow *win, rcti *r_rect)
   const int2 win_size = WM_window_native_pixel_size(win);
   BLI_rcti_init(r_rect, 0, win_size[0], 0, win_size[1]);
 }
+
+void WM_window_safe_area_calc(const wmWindow *win, rcti *r_rect)
+{
+  const int2 win_size = WM_window_native_pixel_size(win);
+  GHOST_IWindow *ghost_window = static_cast<GHOST_IWindow *>(win->runtime->ghostwin);
+  if (ghost_window == nullptr) {
+    BLI_rcti_init(r_rect, 0, win_size.x, 0, win_size.y);
+    return;
+  }
+
+  GHOST_Rect safe_area;
+  ghost_window->getSafeArea(safe_area);
+
+  const float native_pixel_size = ghost_window->getNativePixelSize();
+  r_rect->xmin = int(native_pixel_size * safe_area.l_);
+  r_rect->xmax = int(native_pixel_size * safe_area.r_);
+  r_rect->ymin = win_size.y - int(native_pixel_size * safe_area.b_);
+  r_rect->ymax = win_size.y - int(native_pixel_size * safe_area.t_);
+}
+
 void WM_window_screen_rect_calc(const wmWindow *win, rcti *r_rect)
 {
   rcti window_rect, screen_rect;
@@ -3553,12 +3611,14 @@ bool WM_window_IME_region_refresh(wmWindow *win,
 
   /* A temporary popup is modal, it takes precedence over the region below it,
    * otherwise any redraw while the popup is open re-enables the IME, see #ED_region_do_draw.
-   * Tool-tips match too, harmless as an existing session isn't ended. */
+   * Tool-tips are excluded, they take no input and may outlive the cursor leaving
+   * their region (gizmo tool-tips for e.g.), which would prevent beginning the IME. */
   const bScreen *screen = WM_window_get_active_screen(win);
-  if (!screen->regionbase.is_empty() &&
-      (BKE_screen_find_region_type(screen, RGN_TYPE_TEMPORARY) != nullptr))
-  {
-    return false;
+  const ARegion *tooltip_region = screen->tool_tip ? screen->tool_tip->region : nullptr;
+  for (const ARegion &region_iter : screen->regionbase) {
+    if ((region_iter.regiontype == RGN_TYPE_TEMPORARY) && (&region_iter != tooltip_region)) {
+      return false;
+    }
   }
 
   /* NOTE: ending mid-composition cancels it, so the draw-time refresh opts out via
@@ -3684,6 +3744,9 @@ GHOST_IContext *WM_system_gpu_context_create()
   gpu_settings.context_type = wm_ghost_drawing_context_type(gpu_backend);
   if (G.debug & G_DEBUG_GPU) {
     gpu_settings.flags |= GHOST_gpuDebugContext;
+  }
+  if (G.debug & G_DEBUG_GPU_NO_HW_RAYTRACING) {
+    gpu_settings.flags |= GHOST_gpuNoHWRaytracing;
   }
   gpu_settings.preferred_device = GPU_backend_preferred_device_get();
   if (GPU_backend_vsync_is_overridden()) {

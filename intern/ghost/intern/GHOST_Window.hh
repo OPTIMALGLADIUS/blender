@@ -70,6 +70,9 @@ class GHOST_Window : public GHOST_IWindow {
    */
   ~GHOST_Window() override;
 
+  /** \copydoc #GHOST_IWindow::getSafeArea */
+  void getSafeArea(GHOST_Rect &bounds) const override;
+
   /** \copydoc #GHOST_IWindow::getValid */
   bool getValid() const override
   {
@@ -226,6 +229,16 @@ class GHOST_Window : public GHOST_IWindow {
     user_data_ = user_data;
   }
 
+  void setTouchCaptureCallback(TouchCaptureFn callback) override
+  {
+    touch_capture_ = callback;
+  }
+
+  bool shouldCaptureTouch(int32_t x, int32_t y) const override
+  {
+    return touch_capture_ && touch_capture_(user_data_, x, y);
+  }
+
   /** \copydoc #GHOST_IWindow::getNativePixelSize */
   float getNativePixelSize() override
   {
@@ -335,6 +348,7 @@ class GHOST_Window : public GHOST_IWindow {
 
   /** The window user data */
   GHOST_TUserDataPtr user_data_;
+  TouchCaptureFn touch_capture_ = nullptr;
 
   /** The current visibility of the cursor */
   bool cursor_visible_;

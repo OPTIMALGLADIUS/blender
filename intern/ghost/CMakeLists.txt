@@ -48,6 +48,7 @@ set(SRC
   intern/GHOST_EventKey.hh
   intern/GHOST_EventManager.hh
   intern/GHOST_EventString.hh
+  intern/GHOST_EventTouch.hh
   intern/GHOST_EventTrackpad.hh
   intern/GHOST_EventWheel.hh
   intern/GHOST_ModifierKeys.hh
@@ -574,7 +575,7 @@ elseif(UNIX)
     add_definitions(-DPREFIX="${CMAKE_INSTALL_PREFIX}")
 
     # NOTE: A Python module is itself a library: its wrapper libraries are bundled in the package
-    # beside the add-on, so it doesn't need a separate system libraries path.
+    # (`bpy/lib`), so it doesn't need a separate system libraries path.
     if(NOT WITH_PYTHON_MODULE)
       # The standard variable for this path is `CMAKE_INSTALL_LIBDIR` (typically `lib` or `lib64`).
       # It isn't set by default, but systems that build packages may define it.

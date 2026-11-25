@@ -2239,6 +2239,18 @@ static int panel_drag_collapse_handler(bContext *C, const wmEvent *event, void *
   PanelDragCollapseHandle *dragcol_data = static_cast<PanelDragCollapseHandle *>(userdata);
   short retval = WM_UI_HANDLER_CONTINUE;
 
+  if (event->flag & WM_EVENT_TOUCH_ONE_FINGER) {
+    /* One-finger motion scrolls View2D regions. If a panel drag handler was activated before the
+     * gesture crossed its threshold, discard it instead of toggling every crossed panel. */
+    WM_event_remove_ui_handler(&win->runtime->modalhandlers,
+                               panel_drag_collapse_handler,
+                               panel_drag_collapse_handler_remove,
+                               dragcol_data,
+                               true);
+    panel_drag_collapse_handler_remove(C, dragcol_data);
+    return WM_UI_HANDLER_CONTINUE;
+  }
+
   switch (event->type) {
     case MOUSEMOVE:
       panel_drag_collapse(C, dragcol_data, event->xy);
@@ -2658,6 +2670,7 @@ static int handle_panel_category_cycling(const wmEvent *event,
 
 void panel_region_width_set(ARegion *region, const float aspect, int unscaled_size)
 {
+  BLI_assert(BKE_regiontype_uses_category_tabs(region->runtime->type));
   const float size_new = unscaled_size / aspect;
   if (region->alignment & RGN_ALIGN_RIGHT) {
     region->winrct.xmin = region->winrct.xmax - (size_new * UI_SCALE_FAC);
@@ -2680,6 +2693,13 @@ int handler_panel_region(bContext *C,
                          ARegion *region,
                          const Button *active_but)
 {
+  /* A one-finger touch drag also emits a mouse press for dragging non-scrollable UI. Once the
+   * gesture has crossed the drag threshold, prefer View2D scrolling over expanding/collapsing
+   * panels beneath the finger. A tap uses an untagged mouse event and remains unchanged. */
+  if (event->type == LEFTMOUSE && (event->flag & WM_EVENT_TOUCH_ONE_FINGER)) {
+    return WM_UI_HANDLER_CONTINUE;
+  }
+
   if (event->val == KM_RELEASE) {
     return WM_UI_HANDLER_CONTINUE;
   }
@@ -3047,6 +3067,19 @@ void region_panels_sort_for_search_filter_visibility_change(bContext *C, const A
   }
   std::stable_sort(panel_sort.begin(), panel_sort.end(), find_highest_panel);
   panel_activate_state(C, panel_sort.first().panel, PANEL_STATE_ANIMATION);
+}
+
+bool panel_region_visible_width_ensure(ARegion *region)
+{
+  BLI_assert(BKE_regiontype_uses_category_tabs(region->runtime->type));
+  if (!region_panels_fits_only_categories(region)) {
+    return false;
+  }
+  const float aspect = BLI_rctf_size_y(&region->v2d.cur) /
+                       (BLI_rcti_size_y(&region->v2d.mask) + 1);
+  const int new_width = region->runtime->type->prefsizex ? region->runtime->type->prefsizex : 250;
+  panel_region_width_set(region, aspect, new_width);
+  return true;
 }
 
 /** \} */

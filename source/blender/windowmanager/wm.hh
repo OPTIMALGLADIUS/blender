@@ -32,6 +32,8 @@ struct Main;
  * call to avoid leaking memory when trying to exit from within operators.
  */
 void wm_exit_schedule_delayed(const bContext *C);
+/** Write #BLENDER_QUIT_FILE, used by "Recover Last Session". */
+void wm_quit_file_write(bContext *C);
 
 /**
  * Context is allowed to be NULL, do not free wm itself `lib_id.cc`.
@@ -43,6 +45,12 @@ extern void wm_close_and_free(bContext *C, wmWindowManager *);
  */
 extern void wm_add_default(Main *bmain, bContext *C);
 extern void wm_clear_default_size(bContext *C);
+
+/**
+ * On startup, open the last project, before reading the startup file.
+ * \return true if a project was opened.
+ */
+bool wm_init_last_project_on_startup(Main *bmain);
 
 /* Register to window-manager for redo or macro. */
 
@@ -147,9 +155,5 @@ void wm_virtual_keyboard_window_close(wmWindow *win);
  * Initialize operator properties.
  */
 void wm_open_init_load_ui(wmOperator *op, bool use_prefs);
-/**
- * Return true if the script auto-execution should be cleared based on #WM_file_autoexec_init.
- */
-bool wm_open_init_use_scripts(wmOperator *op, bool use_prefs) ATTR_WARN_UNUSED_RESULT;
 
 }  // namespace blender

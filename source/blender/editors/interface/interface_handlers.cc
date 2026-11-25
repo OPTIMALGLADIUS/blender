@@ -438,6 +438,7 @@ struct HandleButtonData {
   std::string text_edit_unit_hint;
 
   wmTimer *text_select_auto_scroll = nullptr;
+  double text_select_auto_scroll_last_time = std::numeric_limits<double>::lowest();
 
   double value = 0.0f;
   double origvalue = 0.0f;
@@ -1205,6 +1206,13 @@ static void apply_but_funcs_after(bContext *C)
     }
 
     if (after.region_popup) {
+      /* The operator may have freed the popup, for example by loading a file. */
+      bScreen *screen = CTX_wm_screen(C);
+      if (region_popup_prev &&
+          !(screen && BLI_findindex(&screen->regionbase, region_popup_prev) != -1))
+      {
+        region_popup_prev = nullptr;
+      }
       CTX_wm_region_popup_set(C, region_popup_prev);
     }
 
@@ -4364,23 +4372,6 @@ static int do_but_textedit(
         retval = WM_UI_HANDLER_BREAK;
         break;
       }
-      case MOUSEPAN: {
-        if (textbox) {
-          int type = event->type;
-          int value = event->val;
-
-          pan_to_scroll(event, &type, &value);
-          int scroll_dir = 1;
-          if (event->flag & WM_EVENT_SCROLL_INVERT) {
-            scroll_dir = -1;
-          }
-          if (type != MOUSEPAN) {
-            textbox_add_scroll(textbox, (type == WHEELUPMOUSE ? -1 : 1) * scroll_dir);
-          }
-          retval = WM_UI_HANDLER_BREAK;
-        }
-        break;
-      }
       case WHEELDOWNMOUSE:
       case EVT_DOWNARROWKEY:
         if (data->searchbox) {
@@ -4481,6 +4472,13 @@ static int do_but_textedit(
           changed = autocomplete != AUTOCOMPLETE_NO_MATCH;
 
           if (autocomplete == AUTOCOMPLETE_FULL_MATCH) {
+            if (but->flag & BUT_TEXTEDIT_AUTOCOMPLETE_KEEP_ACTIVE) {
+              /* Exit to apply, then re-activate (as with Tab cycling between text fields),
+               * so this only runs when Tab is pressed, see: #150689. */
+              but->flag |= BUT_ACTIVATE_ON_INIT_NO_SELECT;
+              data->postbut = but;
+              data->posttype = BUTTON_ACTIVATE_TEXT_EDITING;
+            }
             button_activate_state(C, but, BUTTON_STATE_EXIT);
           }
         }
@@ -4639,6 +4637,14 @@ static int do_but_textedit_select(
       if (!textbox || event->customdata != data->text_select_auto_scroll) {
         break;
       }
+
+      const wmTimer *timer = static_cast<const wmTimer *>(event->customdata);
+      if (timer->time_duration == data->text_select_auto_scroll_last_time) {
+        retval = WM_UI_HANDLER_BREAK;
+        break;
+      }
+      data->text_select_auto_scroll_last_time = timer->time_duration;
+
       rctf rect;
       block_to_window_rctf(data->region, block, &rect, &but->rect);
 
@@ -5610,6 +5616,21 @@ static int do_but_TEXTBOX(bContext *C,
   switch (data->state) {
     case BUTTON_STATE_TEXT_EDITING:
     case BUTTON_STATE_HIGHLIGHT: {
+      if (event->type == MOUSEPAN && textbox->last_total_lines > textbox->visible_lines()) {
+        int type = event->type;
+        int value = event->val;
+
+        pan_to_scroll(event, &type, &value);
+        int scroll_dir = 1;
+        if (event->flag & WM_EVENT_SCROLL_INVERT) {
+          scroll_dir = -1;
+        }
+        if (type != MOUSEPAN) {
+          textbox_add_scroll(textbox, (type == WHEELUPMOUSE ? -1 : 1) * scroll_dir);
+          ED_region_tag_redraw(data->region);
+        }
+        return WM_UI_HANDLER_BREAK;
+      }
       if (ELEM(event->type, WHEELUPMOUSE, WHEELDOWNMOUSE)) {
         if (textbox->last_total_lines > textbox->visible_lines()) {
           textbox_add_scroll(textbox, (event->type == WHEELUPMOUSE ? -1 : 1));
@@ -7343,7 +7364,7 @@ static bool numedit_but_UNITVEC(
 
 static void palette_set_active(ButtonColor *color_but)
 {
-  if (color_but->is_pallete_color) {
+  if (color_but->is_palette_color) {
     Palette *palette = id_cast<Palette *>(color_but->rnapoin.owner_id);
     const PaletteColor *color = static_cast<const PaletteColor *>(color_but->rnapoin.data);
     palette->active_color = BLI_findindex(&palette->colors, color);
@@ -7410,7 +7431,7 @@ static int do_but_COLOR(bContext *C, Button *but, HandleButtonData *data, const 
       apply_but(C, but->block, but, data, true);
       return WM_UI_HANDLER_BREAK;
     }
-    if (color_but->is_pallete_color && (event->type == EVT_DELKEY) && (event->val == KM_PRESS)) {
+    if (color_but->is_palette_color && (event->type == EVT_DELKEY) && (event->val == KM_PRESS)) {
       Palette *palette = id_cast<Palette *>(but->rnapoin.owner_id);
       PaletteColor *color = static_cast<PaletteColor *>(but->rnapoin.data);
 
@@ -7441,7 +7462,7 @@ static int do_but_COLOR(bContext *C, Button *but, HandleButtonData *data, const 
     }
 
     if (event->type == LEFTMOUSE && event->val == KM_RELEASE) {
-      if (color_but->is_pallete_color) {
+      if (color_but->is_palette_color) {
         if ((event->modifier & KM_CTRL) == 0) {
           float color[3];
           Paint *paint = BKE_paint_get_active_from_context(C);
@@ -9529,7 +9550,7 @@ static ARegion *but_tooltip_init(
   if (*pass == 1) {
     is_quick_tip = true;
     (*pass)--;
-    (*r_pass_delay) = UI_TOOLTIP_DELAY - UI_TOOLTIP_DELAY_QUICK;
+    (*r_pass_delay) = UI_TOOLTIP_DELAY + UI_TOOLTIP_DELAY_QUICK;
   }
 
   Button *but = region_active_but_get(region);
@@ -10385,7 +10406,7 @@ static Button *but_find_open_event(ARegion *region, const wmEvent *event)
 
 static int handle_button_over(bContext *C, const wmEvent *event, ARegion *region)
 {
-  if (event->type == MOUSEMOVE) {
+  if (event->type == MOUSEMOVE && CTX_wm_window(C)->runtime->cursor_hover_enabled) {
     const bool labeledit = event->modifier & KM_CTRL;
     /* Allow buttons to be activated to show the tool-tip,
      * then force-disable them if they're not considered interactive
@@ -11098,7 +11119,7 @@ static int handle_uilist_event(bContext *C, const wmEvent *event, ARegion *regio
 }
 
 /* Handle mouse hover for Views and UiList rows. */
-static int handle_viewlist_items_hover(const wmEvent *event, ARegion *region)
+static int handle_viewlist_items_hover(const bContext *C, const wmEvent *event, ARegion *region)
 {
   const bool has_list = !region->ui_lists.is_empty();
   const bool has_view = [&]() {
@@ -11119,6 +11140,9 @@ static int handle_viewlist_items_hover(const wmEvent *event, ARegion *region)
   Button *highlight_row_but = [&]() -> Button * {
     if (Button *but = view_item_find_search_highlight(region)) {
       return but;
+    }
+    if (!CTX_wm_window(C)->runtime->cursor_hover_enabled) {
+      return nullptr;
     }
     if (Button *but = view_item_find_mouse_over(region, event->xy)) {
       return but;
@@ -11922,7 +11946,8 @@ static int handle_menu_event(bContext *C,
         /* Initial press before starting to drag. */
         WM_cursor_set(win, PopupTitleDragCursor);
       }
-      else if (event->type == MOUSEMOVE && !win->modalcursor) {
+      else if (event->type == MOUSEMOVE && win->runtime->cursor_hover_enabled && !win->modalcursor)
+      {
         /* Hover over draggable area. */
         WM_cursor_set(win, PopupTitleHoverCursor);
       }
@@ -11973,7 +11998,7 @@ static int handle_menu_event(bContext *C,
     }
   }
   else if (event->type == TIMER && event->customdata == menu->scrolltimer) {
-    if (!menu_scroll_test(block, {mx, my})) {
+    if (!win->runtime->cursor_hover_enabled || !menu_scroll_test(block, {mx, my})) {
       WM_event_timer_remove(CTX_wm_manager(C), win, menu->scrolltimer);
       menu->scrolltimer = nullptr;
     }
@@ -11984,7 +12009,7 @@ static int handle_menu_event(bContext *C,
   }
   else {
     /* for mouse_motion_towards_block */
-    if (event->type == MOUSEMOVE) {
+    if (event->type == MOUSEMOVE && win->runtime->cursor_hover_enabled) {
       if (block->flag & (BLOCK_MOVEMOUSE_QUIT | BLOCK_POPOVER)) {
         mouse_motion_towards_init(menu, event->xy);
       }
@@ -12476,14 +12501,23 @@ static int handle_menu_event(bContext *C,
         if (but_active && menu->keynav_state.is_keynav) {
           /* Key-navigation activates the button navigated onto, not the default. */
         }
+        else if ((but_default != nullptr) &&
+                 ((but_default->type == ButtonType::But) &&
+                  ((but_default->active == nullptr) ||
+                   (but_default->active->state == BUTTON_STATE_HIGHLIGHT))))
+        {
+          /* Regarding the #BUTTON_STATE_HIGHLIGHT check above.
+           * It's important to run immediately in this case. Letting the button flash first
+           * (see #BUTTON_STATE_WAIT_FLASH) delays running it until a timer fires,
+           * so events after "Return" reach the popup while it's still open and are lost.
+           * This can happen while typing quickly or a slow redraw.
+           * It also happens during tests that use simulated events. */
+
+          button_execute(C, region, but_default);
+          retval = WM_UI_HANDLER_BREAK;
+        }
         else if ((but_default != nullptr) && (but_default->active == nullptr)) {
-          if (but_default->type == ButtonType::But) {
-            button_execute(C, region, but_default);
-            retval = WM_UI_HANDLER_BREAK;
-          }
-          else {
-            handle_button_activate_by_type(C, region, but_default);
-          }
+          handle_button_activate_by_type(C, region, but_default);
         }
         /* enter will always close this block, we let the event
          * get handled by the button if it is activated, otherwise we cancel */
@@ -12511,7 +12545,9 @@ static int handle_menu_event(bContext *C,
       else {
 
         /* check mouse moving outside of the menu */
-        if (inside == false && (block->flag & (BLOCK_MOVEMOUSE_QUIT | BLOCK_POPOVER))) {
+        if (win->runtime->cursor_hover_enabled && inside == false &&
+            (block->flag & (BLOCK_MOVEMOUSE_QUIT | BLOCK_POPOVER)))
+        {
           SafetyRect *saferct;
 
           mouse_motion_towards_check(block, menu, event->xy, is_parent_inside == false);
@@ -12982,6 +13018,13 @@ static int handle_menus_recursive(bContext *C,
   int retval = WM_UI_HANDLER_CONTINUE;
   bool do_towards_reinit = false;
 
+  if ((event->flag & WM_EVENT_TOUCH_ONE_FINGER) && ELEM(event->type, MOUSEPAN, MOUSEROTATE)) {
+    /* A one-finger touch drag emits both mouse motion and a trackpad-style event. Menus use the
+     * mouse stream to follow the finger. Handling both events would wrongly flicker selection
+     * between the finger and gesture-origin positions. */
+    return WM_UI_HANDLER_BREAK;
+  }
+
   /* check if we have a submenu, and handle events for it first */
   Button *but = region_find_active_but(menu->region);
   HandleButtonData *data = (but) ? but->active : nullptr;
@@ -13008,7 +13051,9 @@ static int handle_menus_recursive(bContext *C,
           C, event, submenu, level + 1, is_parent_inside || inside, is_menu, false);
     }
   }
-  else if (!but && event->val == KM_PRESS && event->type == LEFTMOUSE) {
+  else if (!but && event->val == KM_PRESS && event->type == LEFTMOUSE &&
+           (event->flag & WM_EVENT_TOUCH_ONE_FINGER) == 0)
+  {
     for (Block &block : menu->region->runtime->uiblocks) {
       if (block.panel) {
         int mx = event->xy[0];
@@ -13075,8 +13120,13 @@ static int handle_menus_recursive(bContext *C,
       }
       else if (event->type == LEFTMOUSE || event->val != KM_DBL_CLICK) {
         bool handled = false;
-
-        if (Button *listbox = listbox_find_mouse_over(menu->region, event)) {
+        const Button *active_but = region_find_active_but(menu->region);
+        const bool is_actbut_in_modal_state = active_but &&
+                                              button_modal_state(active_but->active->state);
+        /* Handle uilist events if there not an active button in modal state. */
+        if (Button *listbox = listbox_find_mouse_over(menu->region, event);
+            listbox && !is_actbut_in_modal_state)
+        {
           const int retval_test = handle_uilist_event(C, event, menu->region, listbox);
           if (retval_test != WM_UI_HANDLER_CONTINUE) {
             retval = retval_test;
@@ -13093,7 +13143,7 @@ static int handle_menus_recursive(bContext *C,
   }
 
   if (!menu->retvalue) {
-    handle_viewlist_items_hover(event, menu->region);
+    handle_viewlist_items_hover(C, event, menu->region);
   }
   /* Handle mouse clicks on overlapping view item button. */
   handle_view_item_event(C, event, but, menu->region);
@@ -13168,7 +13218,7 @@ static int region_handler(bContext *C, const wmEvent *event, void * /*userdata*/
 
   /* Always do this, to reliably update view and UI-list item highlighting, even if
    * the mouse hovers a button nested in the item (it's an overlapping layout). */
-  handle_viewlist_items_hover(event, region);
+  handle_viewlist_items_hover(C, event, region);
   if (retval == WM_UI_HANDLER_CONTINUE) {
     retval = handle_view_item_event(C, event, but, region);
   }
@@ -13321,7 +13371,8 @@ static int handler_region_menu(bContext *C, const wmEvent *event, void * /*userd
     /* handle activated button events */
     HandleButtonData *data = but->active;
 
-    if ((data->state == BUTTON_STATE_MENU_OPEN) &&
+    if (CTX_wm_window(C)->runtime->cursor_hover_enabled &&
+        (data->state == BUTTON_STATE_MENU_OPEN) &&
         /* Make sure this popup isn't dragging a button.
          * can happen with popovers (see #67882). */
         (region_find_active_but(data->menu->region) == nullptr) &&
@@ -13887,6 +13938,27 @@ void UI_screen_free_active_but_highlight(const bContext *C, bScreen *screen)
         }
       }
     }
+  }
+}
+
+void UI_region_clear_hover(const bContext *C, ARegion *region)
+{
+  bool changed = false;
+  for (Block &block : region->runtime->uiblocks) {
+    for (Button &but : block.buttons()) {
+      if (but.active && but.active->state == BUTTON_STATE_HIGHLIGHT &&
+          but.active->menu == nullptr && but.active->searchbox == nullptr)
+      {
+        button_active_free(C, &but);
+      }
+      if (but.flag & UI_HOVER) {
+        but.flag &= ~UI_HOVER;
+        changed = true;
+      }
+    }
+  }
+  if (changed) {
+    ED_region_tag_redraw_no_rebuild(region);
   }
 }
 

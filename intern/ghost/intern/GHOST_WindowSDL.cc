@@ -16,6 +16,7 @@
 #endif
 
 #include <cassert>
+#include <cstdlib>
 
 GHOST_WindowSDL::GHOST_WindowSDL(GHOST_SystemSDL *system,
                                  const char *title,
@@ -205,6 +206,17 @@ void GHOST_WindowSDL::getClientBounds(GHOST_Rect &bounds) const
   bounds.r_ = x + w;
   bounds.t_ = y;
   bounds.b_ = y + h;
+}
+
+void GHOST_WindowSDL::getSafeArea(GHOST_Rect &bounds) const
+{
+  SDL_Rect safe_area;
+  if (!SDL_GetWindowSafeArea(sdl_win_, &safe_area)) {
+    GHOST_Window::getSafeArea(bounds);
+    return;
+  }
+
+  bounds.set(safe_area.x, safe_area.y, safe_area.x + safe_area.w, safe_area.y + safe_area.h);
 }
 
 GHOST_TSuccess GHOST_WindowSDL::setClientWidth(uint32_t width)
@@ -678,6 +690,17 @@ GHOST_TSuccess GHOST_WindowSDL::setWindowCursorVisibility(bool visible)
 
 uint16_t GHOST_WindowSDL::getDPIHint()
 {
+#ifdef __ANDROID__
+  /* BlenderActivity may shrink the surface buffers; fewer pixels for the same screen means a
+   * proportionally lower density, else the UI would be drawn at twice its physical size. */
+  static const int divisor = []() {
+    const char *value = getenv("BLENDER_ANDROID_RENDER_DIVISOR");
+    const int v = value ? atoi(value) : 1;
+    return (v >= 1 && v <= 4) ? v : 1;
+  }();
+  return uint16_t(240 / divisor);
+#endif
+
   SDL_DisplayID display_id = SDL_GetDisplayForWindow(sdl_win_);
   if (display_id == 0) {
     return 96;

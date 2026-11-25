@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <cstring>
+
 #include "xxhash.h"
 
 #include "BLI_map.hh"
@@ -82,11 +84,24 @@ struct VKGraphicsInfo {
     VkShaderModule vk_fragment_module;
     VkPrimitiveTopology vk_topology;
     uint32_t viewport_count;
+    /**
+     * Viewports & scissors baked into the pipeline when
+     * `VKWorkarounds::static_viewport_scissor` is set; part of the pipeline key.
+     */
+    Vector<VkViewport, GPU_MAX_VIEWPORTS> viewports;
+    Vector<VkRect2D, GPU_MAX_VIEWPORTS> scissors;
     GPUState state;
     Vector<shader::SpecializationConstant::Value> specialization_constants;
     bool has_depth;
     bool has_stencil;
     uint32_t max_input_attachment_index = 0;
+    /* Color attachment count of the render pass this shaders library is linked with.
+     *
+     * When VK_KHR_dynamic_rendering_local_read is used and the shader declares input attachments,
+     * VkPipelineRenderingCreateInfo::colorAttachmentCount and
+     * VkRenderingInputAttachmentIndexInfo::colorAttachmentCount must match the count declared
+     * by the fragment output library (VUID-VkGraphicsPipelineCreateInfo-renderPass-09531). */
+    uint32_t color_attachment_count = 0;
 
     bool operator==(const Shaders &other) const
     {
@@ -97,12 +112,22 @@ struct VKGraphicsInfo {
              viewport_count == other.viewport_count && state == other.state &&
              specialization_constants == other.specialization_constants &&
              has_depth == other.has_depth && has_stencil == other.has_stencil &&
-             max_input_attachment_index == other.max_input_attachment_index;
+             max_input_attachment_index == other.max_input_attachment_index &&
+             color_attachment_count == other.color_attachment_count &&
+             viewports.size() == other.viewports.size() &&
+             scissors.size() == other.scissors.size() &&
+             memcmp(viewports.data(),
+                    other.viewports.data(),
+                    viewports.size() * sizeof(VkViewport)) == 0 &&
+             memcmp(scissors.data(), other.scissors.data(), scissors.size() * sizeof(VkRect2D)) ==
+                 0;
     }
 
     uint64_t hash() const
     {
       uint64_t hash = viewport_count;
+      hash = hash * 33 ^ XXH3_64bits(viewports.data(), viewports.size() * sizeof(VkViewport));
+      hash = hash * 33 ^ XXH3_64bits(scissors.data(), scissors.size() * sizeof(VkRect2D));
       hash = hash * 33 ^ uint64_t(vk_vertex_module);
       hash = hash * 33 ^ uint64_t(vk_geometry_module);
       hash = hash * 33 ^ uint64_t(vk_fragment_module);
@@ -112,6 +137,7 @@ struct VKGraphicsInfo {
       hash = hash * 33 ^ specialization_constants.hash();
       hash = hash * 33 ^ (uint64_t(has_depth) << 1 | uint64_t(has_stencil));
       hash = hash * 33 ^ uint64_t(max_input_attachment_index);
+      hash = hash * 33 ^ uint64_t(color_attachment_count);
       return hash;
     }
 
@@ -186,7 +212,17 @@ struct VKGraphicsInfo {
  * Thread safe map to pipelines of a certain type (graphics or compute).
  */
 template<typename PipelineInfo> class VKPipelineMap {
-  Map<PipelineInfo, VkPipeline> pipelines_;
+  struct PipelineState {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    /**
+     * Pipeline creation was attempted and failed. A null handle alone cannot tell "another
+     * thread is still compiling" from "the driver refused to create it"; waiting on the latter
+     * would block forever.
+     */
+    bool failed = false;
+  };
+
+  Map<PipelineInfo, PipelineState> pipelines_;
   Mutex mutex_;
   std::condition_variable_any new_pipeline_added_;
 
@@ -215,18 +251,23 @@ template<typename PipelineInfo> class VKPipelineMap {
     r_created = false;
     {
       std::scoped_lock lock(mutex_);
-      const VkPipeline *found_pipeline = pipelines_.lookup_ptr(pipeline_info);
+      const PipelineState *found_pipeline = pipelines_.lookup_ptr(pipeline_info);
       if (found_pipeline) {
-        if (*found_pipeline == VK_NULL_HANDLE) {
+        if (found_pipeline->failed) {
+          /* Creation already failed; return the failure instead of waiting for a completion
+           * that will never happen. */
+          return VK_NULL_HANDLE;
+        }
+        if (found_pipeline->pipeline == VK_NULL_HANDLE) {
           do_wait_for_pipeline = true;
         }
         else {
           /* Early exit: pipeline_info found and has a valid pipeline. */
-          return *found_pipeline;
+          return found_pipeline->pipeline;
         }
       }
       else {
-        pipelines_.add_new(pipeline_info, VK_NULL_HANDLE);
+        pipelines_.add_new(pipeline_info, PipelineState{});
         do_compile_pipeline = true;
       }
     }
@@ -239,8 +280,9 @@ template<typename PipelineInfo> class VKPipelineMap {
       /* Store result in the compute pipelines map. */
       {
         std::scoped_lock lock(mutex_);
-        VkPipeline &pipeline_item = pipelines_.lookup(pipeline_info);
-        pipeline_item = pipeline;
+        PipelineState &pipeline_item = pipelines_.lookup(pipeline_info);
+        pipeline_item.pipeline = pipeline;
+        pipeline_item.failed = pipeline == VK_NULL_HANDLE;
       }
       /* Notify other threads that a new pipeline is available. */
       {
@@ -260,7 +302,9 @@ template<typename PipelineInfo> class VKPipelineMap {
     std::scoped_lock lock(mutex_);
     pipelines_.remove_if([&](auto item) {
       if (item.key.vk_pipeline_layout_get() == vk_pipeline_layout) {
-        discard_pool.discard_pipeline(item.value);
+        if (item.value.pipeline != VK_NULL_HANDLE) {
+          discard_pool.discard_pipeline(item.value.pipeline);
+        }
         return true;
       }
       return false;
@@ -274,8 +318,10 @@ template<typename PipelineInfo> class VKPipelineMap {
   void free_data(VkDevice vk_device, const volk::VolkDeviceTable &functions)
   {
     std::scoped_lock lock(mutex_);
-    for (VkPipeline &vk_pipeline : pipelines_.values()) {
-      functions.vkDestroyPipeline(vk_device, vk_pipeline, nullptr);
+    for (PipelineState &pipeline_state : pipelines_.values()) {
+      if (pipeline_state.pipeline != VK_NULL_HANDLE) {
+        functions.vkDestroyPipeline(vk_device, pipeline_state.pipeline, nullptr);
+      }
     }
     pipelines_.clear();
   }
@@ -313,13 +359,13 @@ template<typename PipelineInfo> class VKPipelineMap {
   VkPipeline wait_for_completion(const PipelineInfo &pipeline_info)
   {
     std::unique_lock<Mutex> lock(mutex_);
-    const VkPipeline *pipeline = nullptr;
+    PipelineState *pipeline_state = nullptr;
     new_pipeline_added_.wait(lock, [&]() {
-      pipeline = pipelines_.lookup_ptr(pipeline_info);
-      BLI_assert(pipeline != nullptr);
-      return *pipeline != VK_NULL_HANDLE;
+      pipeline_state = pipelines_.lookup_ptr(pipeline_info);
+      BLI_assert(pipeline_state != nullptr);
+      return pipeline_state->failed || pipeline_state->pipeline != VK_NULL_HANDLE;
     });
-    return *pipeline;
+    return pipeline_state->failed ? VK_NULL_HANDLE : pipeline_state->pipeline;
   }
 };
 

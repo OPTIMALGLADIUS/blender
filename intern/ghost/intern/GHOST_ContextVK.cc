@@ -233,8 +233,15 @@ class GHOST_DeviceVK {
   };
   VkPhysicalDeviceFeatures2 features = {};
   VkPhysicalDeviceVulkan11Features features_11 = {};
+  /* Valid on a 1.1 device, unlike the promoted copies in VkPhysicalDeviceVulkan12Features. */
+  VkPhysicalDeviceTimelineSemaphoreFeatures features_timeline_semaphore = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+  VkPhysicalDeviceBufferDeviceAddressFeatures features_buffer_device_address = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+  VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures features_separate_depth_stencil_layouts = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES};
+  /* Only queried on a 1.2 or 1.3 device respectively: asking on an older one is invalid. */
   VkPhysicalDeviceVulkan12Features features_12 = {};
-  /* Only queried on a 1.3 device: asking for it on an older one is invalid. */
   VkPhysicalDeviceVulkan13Features features_13 = {};
   VkPhysicalDeviceRobustness2FeaturesEXT features_robustness2 = {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
@@ -259,12 +266,18 @@ class GHOST_DeviceVK {
 
     features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features_11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
-    features_12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     features.pNext = &features_11;
-    features_11.pNext = &features_12;
-    features_12.pNext = &features_robustness2;
+    features_11.pNext = &features_timeline_semaphore;
+    features_timeline_semaphore.pNext = &features_buffer_device_address;
+    features_buffer_device_address.pNext = &features_separate_depth_stencil_layouts;
+    features_separate_depth_stencil_layouts.pNext = &features_robustness2;
     features_robustness2.pNext = &features_acceleration_structure;
 
+    if (properties.properties.apiVersion >= VK_API_VERSION_1_2) {
+      features_12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+      features_12.pNext = features_11.pNext;
+      features_11.pNext = &features_12;
+    }
     /* Dynamic rendering is core from 1.3 on, and a driver that has it in core stops
      * advertising the extension. Without this the feature is invisible on exactly
      * the devices that support it best. */
@@ -610,6 +623,7 @@ struct GHOST_InstanceVK {
 
   bool create_device(const bool use_vk_ext_swapchain_maintenance1,
                      const bool is_debug,
+                     const bool no_hw_rt,
                      blender::Span<const char *> required_device_extensions,
                      blender::Span<const char *> optional_device_extensions)
   {
@@ -637,6 +651,14 @@ struct GHOST_InstanceVK {
       device.extensions.disable(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
       device.extensions.disable(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
       device.extensions.disable(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    }
+
+    /* Disable ray query & acceleration structure extensions.
+     * Some driver have issue with capture replay in renderdoc with these specific extensions.
+     */
+    if (no_hw_rt) {
+      device.extensions.disable(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+      device.extensions.disable(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
     }
 
 #ifdef _WIN32
@@ -703,18 +725,49 @@ struct GHOST_InstanceVK {
 
     std::vector<void *> feature_struct_ptr;
 
-    /* Enable optional vulkan 12 features when supported on physical device. */
-    VkPhysicalDeviceVulkan12Features vulkan_12_features = {};
-    vulkan_12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    vulkan_12_features.shaderOutputLayer = device.features_12.shaderOutputLayer;
-    vulkan_12_features.shaderOutputViewportIndex = device.features_12.shaderOutputViewportIndex;
-    vulkan_12_features.bufferDeviceAddress = device.features_12.bufferDeviceAddress;
-    vulkan_12_features.timelineSemaphore = VK_TRUE;
-    /* Depth-only and stencil-only image layouts are invalid without this, and the backend
-     * uses them whenever it is enabled. */
-    vulkan_12_features.separateDepthStencilLayouts =
-        device.features_12.separateDepthStencilLayouts;
-    feature_struct_ptr.push_back(&vulkan_12_features);
+    /* Features promoted to Vulkan 1.2. VkPhysicalDeviceVulkan12Features is invalid on a 1.1
+     * device, and on a 1.2 device it must not be combined with the per-extension structs it
+     * absorbed, so exactly one of the two forms is chained. Depth-only and stencil-only image
+     * layouts are invalid without separateDepthStencilLayouts, and the backend uses them
+     * whenever the feature is enabled, so it is only requested where supported. */
+    const bool is_vulkan_12 = device.properties.properties.apiVersion >= VK_API_VERSION_1_2;
+    VkPhysicalDeviceVulkan12Features vulkan_12_features = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceTimelineSemaphoreFeatures timeline_semaphore_features = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+    VkPhysicalDeviceBufferDeviceAddressFeatures buffer_device_address_features = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+    VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures separate_depth_stencil_layouts_features =
+        {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES};
+    if (is_vulkan_12) {
+      vulkan_12_features.shaderOutputLayer = device.features_12.shaderOutputLayer;
+      vulkan_12_features.shaderOutputViewportIndex = device.features_12.shaderOutputViewportIndex;
+      vulkan_12_features.bufferDeviceAddress = device.features_12.bufferDeviceAddress;
+      vulkan_12_features.timelineSemaphore = VK_TRUE;
+      vulkan_12_features.separateDepthStencilLayouts =
+          device.features_12.separateDepthStencilLayouts;
+      /* Required whenever VK_EXT_descriptor_indexing is enabled alongside this struct. */
+      vulkan_12_features.descriptorIndexing =
+          device.extensions.is_enabled(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) &&
+          device.features_12.descriptorIndexing;
+      feature_struct_ptr.push_back(&vulkan_12_features);
+    }
+    else {
+      if (device.extensions.is_enabled(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
+        timeline_semaphore_features.timelineSemaphore = VK_TRUE;
+        feature_struct_ptr.push_back(&timeline_semaphore_features);
+      }
+      if (device.extensions.is_enabled(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)) {
+        buffer_device_address_features.bufferDeviceAddress =
+            device.features_buffer_device_address.bufferDeviceAddress;
+        feature_struct_ptr.push_back(&buffer_device_address_features);
+      }
+      if (device.extensions.is_enabled(VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME)) {
+        separate_depth_stencil_layouts_features.separateDepthStencilLayouts =
+            device.features_separate_depth_stencil_layouts.separateDepthStencilLayouts;
+        feature_struct_ptr.push_back(&separate_depth_stencil_layouts_features);
+      }
+    }
 
     /* Enable provoking vertex if available. */
     VkPhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex_features = {};
@@ -997,7 +1050,7 @@ GHOST_ContextVK::GHOST_ContextVK(const GHOST_ContextParams &context_params,
       render_frame_(0),
       use_hdr_swapchain_(false)
 {
-  frame_data_.reserve(5);
+  frame_data_.reserve(6);
 }
 
 GHOST_ContextVK::~GHOST_ContextVK()
@@ -1045,13 +1098,6 @@ GHOST_TSuccess GHOST_ContextVK::swapBufferAcquire()
   GHOST_DeviceVK &device_vk = vulkan_instance->device.value();
   VkDevice vk_device = device_vk.vk_device;
 
-#ifdef __ANDROID__
-  /* Apply a pending native-window swap here, at the synchronized swap boundary. */
-  if (android_surface_dirty_) {
-    applyAndroidSurfaceChange();
-  }
-#endif
-
   /* This method is called after all the draw calls in the application, and it signals that
    * we are ready to both (1) submit commands for those draw calls to the device and
    * (2) begin building the next frame. It is assumed as an invariant that the submission fence
@@ -1087,6 +1133,18 @@ GHOST_TSuccess GHOST_ContextVK::swapBufferAcquire()
     recreateSwapchain(use_hdr_swapchain);
   }
   else {
+#if defined(WITH_GHOST_SDL) && defined(__ANDROID__)
+    /* Android can resize the window without reporting an out-of-date swapchain. Recreate the
+     * swapchain if the render extent and window size do not match. */
+    int win_width = 0, win_height = 0;
+    if (sdl_window_ && SDL_GetWindowSizeInPixels(sdl_window_, &win_width, &win_height)) {
+      if (render_extent_.width != uint32_t(win_width) ||
+          render_extent_.height != uint32_t(win_height))
+      {
+        recreateSwapchain(use_hdr_swapchain);
+      }
+    }
+#endif
 #ifdef WITH_GHOST_WAYLAND
     /* Wayland doesn't provide a WSI with windowing capabilities, therefore cannot detect whether
      * the swap-chain needs to be recreated. But as a side effect we can recreate the swap-chain
@@ -1266,9 +1324,13 @@ GHOST_TSuccess GHOST_ContextVK::swapBufferRelease()
   }
   acquired_swapchain_image_index_.reset();
 
-  /* SUBOPTIMAL presented correctly, so rebuilding on it costs a swapchain every frame:
-   * an IDENTITY preTransform on a rotated display reports it forever by design. */
-  if (present_result == VK_ERROR_OUT_OF_DATE_KHR) {
+#ifdef __ANDROID__
+  /* Android reports SUBOPTIMAL during device orientation changes. */
+  if (present_result == VK_SUBOPTIMAL_KHR) {
+    return GHOST_kSuccess;
+  }
+#endif
+  if (ELEM(present_result, VK_ERROR_OUT_OF_DATE_KHR, VK_SUBOPTIMAL_KHR)) {
     recreateSwapchain(use_hdr_swapchain);
     return GHOST_kSuccess;
   }
@@ -1704,14 +1766,12 @@ GHOST_TSuccess GHOST_ContextVK::recreateSwapchain(bool use_hdr_swapchain)
   create_info.imageArrayLayers = 1;
   create_info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                            (use_hdr_swapchain ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
-  /* Blender does not pre-rotate its rendering, so requesting the surface's
-   * currentTransform (e.g. ROTATE_90 on portrait-native tablets) would show the
-   * UI sideways. Request IDENTITY when supported and let the display compositor
-   * apply the rotation. */
-  create_info.preTransform =
-      (capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ?
-          VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR :
-          capabilities.currentTransform;
+#ifdef __ANDROID__
+  /* Informs the Android compositor to handle image rotation as Blender doesn't pre-rotate. */
+  create_info.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+#else
+  create_info.preTransform = capabilities.currentTransform;
+#endif
   /* Alpha lets the compositor blend the surface against the desktop, needed by CSD for rounded
    * window corners. Not all surfaces support it, so fall back to opaque in those cases. The caller
    * handles the lack of transparency by drawing square corners, see #GHOST_Context::hasAlpha. */
@@ -1846,11 +1906,12 @@ GHOST_TSuccess GHOST_ContextVK::destroySwapchain()
 {
   GHOST_DeviceVK &device_vk = vulkan_instance.value().device.value();
 
+  device_vk.wait_idle();
   if (swapchain_ != VK_NULL_HANDLE) {
     this->destroySwapchainPresentFences(swapchain_);
     device_vk.functions.vkDestroySwapchainKHR(device_vk.vk_device, swapchain_, nullptr);
+    swapchain_ = VK_NULL_HANDLE;
   }
-  device_vk.wait_idle();
   for (GHOST_SwapchainImage &swapchain_image : swapchain_images_) {
     swapchain_image.destroy(device_vk.vk_device, device_vk.functions);
   }
@@ -1865,6 +1926,36 @@ GHOST_TSuccess GHOST_ContextVK::destroySwapchain()
 
   return GHOST_kSuccess;
 }
+
+#ifdef WITH_GHOST_SDL
+GHOST_TSuccess GHOST_ContextVK::recreateSurface()
+{
+  GHOST_InstanceVK &instance_vk = vulkan_instance.value();
+  GHOST_DeviceVK &device_vk = instance_vk.device.value();
+
+  /* Presentation resources retain the native window used to create the surface. */
+  destroySwapchain();
+
+  if (surface_ != VK_NULL_HANDLE) {
+    volk::vkDestroySurfaceKHR(instance_vk.vk_instance, surface_, nullptr);
+    surface_ = VK_NULL_HANDLE;
+  }
+
+  /* Restore the frame used by recreateSwapchain() after destroySwapchain() cleared the vector. */
+  frame_data_.resize(2);
+  render_frame_ = 0;
+
+  if (!SDL_Vulkan_CreateSurface(sdl_window_, instance_vk.vk_instance, nullptr, &surface_)) {
+    CLOG_ERROR(&LOG, "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+    return GHOST_kFailure;
+  }
+
+  const bool use_hdr_swapchain = hdr_info_ &&
+                                 (hdr_info_->wide_gamut_enabled || hdr_info_->hdr_enabled) &&
+                                 device_vk.use_vk_ext_swapchain_colorspace;
+  return recreateSwapchain(use_hdr_swapchain);
+}
+#endif
 
 std::vector<const char *> GHOST_ContextVK::getPlatformSpecificSurfaceExtensions() const
 {
@@ -2162,6 +2253,7 @@ GHOST_TSuccess GHOST_ContextVK::initializeDrawingContext()
 
     if (!instance_vk.create_device(use_vk_ext_swapchain_colorspace,
                                    context_params_.is_debug,
+                                   context_params_.no_hw_rt,
                                    required_device_extensions,
                                    optional_device_extensions))
     {
@@ -2179,81 +2271,6 @@ GHOST_TSuccess GHOST_ContextVK::initializeDrawingContext()
   active_context_ = this;
   return GHOST_kSuccess;
 }
-
-#ifdef __ANDROID__
-GHOST_TSuccess GHOST_ContextVK::setAndroidNativeWindow(ANativeWindow *native_window)
-{
-  /* Only record the change here; the actual surface/swapchain teardown must run
-   * on the render thread at the swap boundary (applyAndroidSurfaceChange), where
-   * the backend's submission thread is synchronized. Doing it here races the
-   * submission thread and corrupts the heap (double free). */
-  __android_log_print(ANDROID_LOG_INFO,
-                      "blender-surface",
-                      "setAndroidNativeWindow old=%p new=%p",
-                      (void *)native_window_,
-                      (void *)native_window);
-  native_window_ = native_window;
-  android_surface_dirty_ = true;
-  return GHOST_kSuccess;
-}
-
-void GHOST_ContextVK::applyAndroidSurfaceChange()
-{
-  __android_log_print(ANDROID_LOG_INFO,
-                      "blender-surface",
-                      "applyAndroidSurfaceChange window=%p surface=%p swapchain=%p",
-                      (void *)native_window_,
-                      (void *)surface_,
-                      (void *)swapchain_);
-  android_surface_dirty_ = false;
-  if (!vulkan_instance.has_value() || !vulkan_instance->device.has_value()) {
-    return;
-  }
-  GHOST_InstanceVK &instance_vk = vulkan_instance.value();
-  GHOST_DeviceVK &device_vk = instance_vk.device.value();
-  device_vk.wait_idle();
-
-  /* Retire the swapchain bound to the old surface. This must complete before the
-   * surface is destroyed (a surface may not be destroyed while a swapchain still
-   * references it). Unlike destroySwapchain() we keep frame_data_ intact, since
-   * recreateSwapchain() relies on it being non-empty. */
-  if (swapchain_ != VK_NULL_HANDLE) {
-    this->destroySwapchainPresentFences(swapchain_);
-    device_vk.functions.vkDestroySwapchainKHR(device_vk.vk_device, swapchain_, nullptr);
-    swapchain_ = VK_NULL_HANDLE;
-  }
-  for (GHOST_SwapchainImage &swapchain_image : swapchain_images_) {
-    swapchain_image.destroy(device_vk.vk_device, device_vk.functions);
-  }
-  swapchain_images_.clear();
-  image_count_ = 0;
-
-  if (surface_ != VK_NULL_HANDLE) {
-    volk::vkDestroySurfaceKHR(instance_vk.vk_instance, surface_, nullptr);
-    surface_ = VK_NULL_HANDLE;
-  }
-
-  /* Window torn down (backgrounded): leave the surface null; the swapchain is
-   * rebuilt when a new window arrives. */
-  if (native_window_ == nullptr) {
-    return;
-  }
-
-  VkAndroidSurfaceCreateInfoKHR info = {};
-  info.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
-  info.window = native_window_;
-  if (volk::vkCreateAndroidSurfaceKHR(instance_vk.vk_instance, &info, nullptr, &surface_) !=
-      VK_SUCCESS)
-  {
-    surface_ = VK_NULL_HANDLE;
-    return;
-  }
-
-  /* Force swapBufferAcquire to rebuild the swapchain for the new surface. */
-  render_extent_ = {0, 0};
-  render_extent_min_ = {0, 0};
-}
-#endif
 
 GHOST_TSuccess GHOST_ContextVK::releaseNativeHandles()
 {

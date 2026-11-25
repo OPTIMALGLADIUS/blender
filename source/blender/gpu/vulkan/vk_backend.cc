@@ -160,10 +160,15 @@ static Vector<StringRefNull> missing_capabilities_get(VkPhysicalDevice vk_physic
 {
   Vector<StringRefNull> missing_capabilities;
   /* Check device features. */
-  VkPhysicalDeviceVulkan12Features features_12 = {
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+  /* The per-extension structs rather than VkPhysicalDeviceVulkan12Features, which is invalid on
+   * a Vulkan 1.1 device. */
+  VkPhysicalDeviceBufferDeviceAddressFeatures features_buffer_device_address = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+  VkPhysicalDeviceTimelineSemaphoreFeatures features_timeline_semaphore = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
+      &features_buffer_device_address};
   VkPhysicalDeviceFeatures2 features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-                                        &features_12};
+                                        &features_timeline_semaphore};
 
   vkGetPhysicalDeviceFeatures2(vk_physical_device, &features);
 
@@ -200,10 +205,10 @@ static Vector<StringRefNull> missing_capabilities_get(VkPhysicalDevice vk_physic
   if (features.features.drawIndirectFirstInstance == VK_FALSE) {
     missing_capabilities.append("draw indirect first instance");
   }
-  if (features_12.timelineSemaphore == VK_FALSE) {
+  if (features_timeline_semaphore.timelineSemaphore == VK_FALSE) {
     missing_capabilities.append("timeline semaphores");
   }
-  if (features_12.bufferDeviceAddress == VK_FALSE) {
+  if (features_buffer_device_address.bufferDeviceAddress == VK_FALSE) {
     missing_capabilities.append("buffer device address");
   }
 
@@ -664,6 +669,7 @@ void VKBackend::detect_workarounds(VKDevice &device)
 
     /* Force workarounds and disable extensions. */
     workarounds.not_aligned_pixel_formats = true;
+    workarounds.static_viewport_scissor = true;
     extensions.shader_viewport_index_layer = false;
     extensions.fragment_shader_barycentric = false;
     extensions.dynamic_rendering = true;
@@ -689,6 +695,12 @@ void VKBackend::detect_workarounds(VKDevice &device)
 
   if (G.debug & G_DEBUG_GPU_NO_TEXTURE_POOL) {
     GCaps.texture_pool_workaround = true;
+  }
+
+  /* Some Qualcomm drivers keep command-buffer-local state written by `vkCmdSetViewport` across
+   * command buffer resets. */
+  if (GPU_type_matches(GPU_DEVICE_QUALCOMM, GPU_OS_ANY, GPU_DRIVER_ANY)) {
+    workarounds.static_viewport_scissor = true;
   }
 
   extensions.shader_viewport_index_layer = device.supports_extension(
@@ -861,6 +873,17 @@ void VKBackend::detect_workarounds(VKDevice &device)
     }
   }
 #endif
+
+  /* Legacy AMD drivers (#142019) don't perform the sRGB conversion when storing a clear value into
+   * an sRGB attachment, so a linear clear color is stored into the sRGB attachment and the
+   * background then renders too bright. Only official AMD drivers up to version 31.0.24002.92
+   * (Vulkan 2.0.294) are affected. */
+  if (GPU_type_matches(GPU_DEVICE_ATI, GPU_OS_WIN, GPU_DRIVER_OFFICIAL)) {
+    const uint32_t driver_version = device.physical_device_properties_get().driverVersion;
+    if (driver_version <= VK_MAKE_API_VERSION(2, 0, 294, 0)) {
+      workarounds.missing_srgb_clear_conversion = true;
+    }
+  }
 
 #ifdef __APPLE__
   extensions.extended_dynamic_state = false;
@@ -1167,6 +1190,9 @@ void VKBackend::capabilities_init(VKDevice &device)
       device.physical_device_acceleration_structure_properties_get().maxGeometryCount > 0 &&
       device.physical_device_acceleration_structure_properties_get().maxPrimitiveCount > 0 &&
       device.physical_device_acceleration_structure_properties_get().maxInstanceCount > 0;
+  if (G.debug & G_DEBUG_GPU_NO_HW_RAYTRACING) {
+    GCaps.ray_query_support = false;
+  }
 
   GCaps.multi_viewport_support = device.physical_device_features_get().multiViewport &&
                                  limits.maxViewports >= GPU_MAX_VIEWPORTS;

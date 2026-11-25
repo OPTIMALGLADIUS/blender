@@ -8,6 +8,12 @@ else()
   set(LLVM_TARGETS X86)
 endif()
 
+if (UNIX AND (NOT CMAKE_CROSSCOMPILING))
+  # When not cross-compiling, build for both x86 and arm64 to accomodate for any ISPC target architecture,
+  # which will then be used during cross-compilation (only supported on macOS/Linux at the moment).
+  set(LLVM_TARGETS AArch64$<SEMICOLON>ARM$<SEMICOLON>X86)
+endif()
+
 if(UNIX AND NOT APPLE)
   # Make llvm's pkgconfig pick up our static xml2 lib
   set(LLVM_XML2_ARGS
@@ -24,7 +30,9 @@ if(APPLE)
   set(BUILD_CLANG_TOOLS ON)
 elseif(MSVC AND BLENDER_PLATFORM_ARM)
   set(LLVM_EXTRA_PROJECTS ^^lld)
-else()
+endif()
+
+if(NOT APPLE)
   # NVIDIA PTX for OSL on Windows and Linux.
   set(LLVM_TARGETS ${LLVM_TARGETS}$<SEMICOLON>NVPTX)
 endif()
@@ -43,8 +51,6 @@ set(LLVM_EXTRA_ARGS
   -DLLVM_ENABLE_PROJECTS=clang${LLVM_EXTRA_PROJECTS}
   -DPython3_ROOT_DIR=${HOST_LIBDIR}/python/
   -DPython3_EXECUTABLE=${PYTHON_BINARY}
-  # Enforce C++17 as C++20 cause compilation errors on recent GCC versions, fixed in LLVM 22.1.0 (GH PR #169772), remove on upgrade.
-  -DCMAKE_CXX_STANDARD=17
   ${LLVM_XML2_ARGS}
 )
 

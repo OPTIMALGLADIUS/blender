@@ -42,6 +42,12 @@ struct StencilState {
  * Compute and graphic shaders use the same structure to setup the pipeline for execution.
  */
 struct VKPipelineData {
+  /**
+   * VK_NULL_HANDLE when the driver refused to create the pipeline. Draw nodes then record nothing
+   * (dispatches never reach the graph, see #VKBackend::compute_dispatch):
+   * binding a null pipeline is invalid usage, and Adreno drivers crash on it instead of
+   * rejecting it. Losing the draw only loses an effect.
+   */
   VkPipeline vk_pipeline;
   VkPipelineLayout vk_pipeline_layout;
   VkDescriptorSet vk_descriptor_set;
@@ -60,7 +66,7 @@ struct VKViewportData {
 
   bool operator==(const VKViewportData &other) const
   {
-    if (viewports.size() != other.viewports.size() && scissors.size() != other.scissors.size()) {
+    if (viewports.size() != other.viewports.size() || scissors.size() != other.scissors.size()) {
       return false;
     }
 
@@ -140,7 +146,7 @@ struct VKIndexBufferBinding {
   bool operator==(const VKIndexBufferBinding &other) const
   {
     return buffer.resource_handle == other.buffer.resource_handle &&
-           index_type == other.index_type;
+           buffer.vk_handle == other.buffer.vk_handle && index_type == other.index_type;
   }
   bool operator!=(const VKIndexBufferBinding &other) const
   {

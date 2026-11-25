@@ -201,7 +201,7 @@ static void blo_update_defaults_screen(bScreen *screen,
                                     SEQ_TIMELINE_STRIP_END_THUMBNAILS;
       seq->preview_overlay.flag |= SEQ_PREVIEW_SHOW_OUTLINE_SELECTED;
       seq->cache_overlay.flag = SEQ_CACHE_SHOW | SEQ_CACHE_SHOW_FINAL_OUT;
-      seq->draw_flag |= SEQ_DRAW_TRANSFORM_PREVIEW;
+      seq->draw_flag |= SEQ_DRAW_EDIT_POINT_PREVIEW;
     }
     else if (area.spacetype == SPACE_TEXT) {
       /* Show syntax and line numbers in Script workspace text editor. */
@@ -322,6 +322,26 @@ static void blo_update_defaults_screen(bScreen *screen,
         v3d->shading.color_type = V3D_SHADING_MATERIAL_COLOR;
         /* Enable Annotations. */
         v3d->flag2 |= V3D_SHOW_ANNOTATION;
+      }
+    }
+  }
+
+  /* Android demo Grease Pencil templates overrides
+   *  - Use solid view (EEVEE lags)
+   *  - Lock View rotation to prevent 1 finger orbiting from exiting the camera. */
+  if (app_template && STR_ELEM(app_template, "2D_Animation", "Storyboarding")) {
+    for (ScrArea &area : screen->areabase) {
+      if (area.spacetype == SPACE_VIEW3D) {
+        View3D *v3d = area.spacedata.first_as<View3D>();
+
+        v3d->shading.type = OB_SOLID;
+
+        for (ARegion &region : area.regionbase) {
+          if (region.regiontype == RGN_TYPE_WINDOW) {
+            RegionView3D *rv3d = static_cast<RegionView3D *>(region.regiondata);
+            rv3d->viewlock |= RV3D_LOCK_ROTATION;
+          }
+        }
       }
     }
   }
@@ -640,7 +660,6 @@ void BLO_update_defaults_startup_blend(Main *bmain, const char *app_template)
       ma = static_cast<Material *>(
           BLI_findstring(&bmain->materials, "Solid Stroke", offsetof(ID, name) + 2));
       if (ma != nullptr) {
-        ma->gp_style->mix_rgba[3] = 1.0f;
         ma->gp_style->texture_offset[0] = -0.5f;
         ma->gp_style->mix_factor = 0.5f;
       }
@@ -650,7 +669,6 @@ void BLO_update_defaults_startup_blend(Main *bmain, const char *app_template)
           BLI_findstring(&bmain->materials, "Solid Fill", offsetof(ID, name) + 2));
       if (ma != nullptr) {
         ma->gp_style->flag &= ~GP_MATERIAL_STROKE_SHOW;
-        ma->gp_style->mix_rgba[3] = 1.0f;
         ma->gp_style->texture_offset[0] = -0.5f;
         ma->gp_style->mix_factor = 0.5f;
       }

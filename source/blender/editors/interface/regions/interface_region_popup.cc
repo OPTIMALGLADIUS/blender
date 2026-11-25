@@ -928,9 +928,16 @@ PopupBlockHandle *popup_block_create(bContext *C,
                                      BlockHandleCreateFunc handle_create_func,
                                      void *arg,
                                      FreeArgFunc arg_free,
-                                     const bool can_refresh)
+                                     const bool can_refresh,
+                                     const int anchor_xy[2])
 {
   wmWindow *window = CTX_wm_window(C);
+
+  /* Needed for the splash popup which may be called before the DPI is set, see #161001. */
+  if (window->runtime && window->runtime->ghostwin) {
+    WM_window_dpi_set_userdef(window);
+  }
+
   Button *activebut = context_active_but_get(C);
 
   /* disable tooltips from buttons below */
@@ -956,7 +963,8 @@ PopupBlockHandle *popup_block_create(bContext *C,
   handle->popup_create_vars.arg_free = arg_free;
   handle->popup_create_vars.but = but;
   handle->popup_create_vars.butregion = but ? butregion : nullptr;
-  copy_v2_v2_int(handle->popup_create_vars.event_xy, window->runtime->eventstate->xy);
+  copy_v2_v2_int(handle->popup_create_vars.event_xy,
+                 anchor_xy ? anchor_xy : window->runtime->eventstate->xy);
 
   /* create area region */
   ARegion *region = region_temp_add(CTX_wm_screen(C));

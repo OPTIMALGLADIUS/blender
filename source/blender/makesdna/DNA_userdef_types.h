@@ -53,6 +53,7 @@ enum eUserPref_Flag : int {
   USER_ADD_VIEWALIGNED = (1 << 19),
   USER_RELPATHS = (1 << 20),
   USER_RELEASECONFIRM = (1 << 21),
+  /** See #G_FLAG_SCRIPT_AUTOEXEC for an overview of auto-execution. */
   USER_SCRIPT_AUTOEXEC_DISABLE = (1 << 22),
   USER_FILENOUI = (1 << 23),
   USER_NONEGFRAMES = (1 << 24),
@@ -93,6 +94,7 @@ enum eUserpref_Save_Modified_Images : char {
 enum eUserPref_PrefFlag : char {
   USER_PREF_FLAG_SAVE = (1 << 0),
   USER_PREF_FLAG_PROJECT_SAVE = (1 << 1),
+  USER_PREF_FLAG_PROJECT_REMEMBER = (1 << 2),
 };
 ENUM_OPERATORS(eUserPref_PrefFlag)
 
@@ -200,6 +202,7 @@ enum eUserpref_GPU_Flag : char {
   USER_GPU_FLAG_OVERLAY_SMOOTH_WIRE = (1 << 2),
   USER_GPU_FLAG_SUBDIVISION_EVALUATION = (1 << 3),
   USER_GPU_FLAG_FRESNEL_EDIT = (1 << 4),
+  USER_GPU_FLAG_VIDEO_DECODING = (1 << 5),
 };
 ENUM_OPERATORS(eUserpref_GPU_Flag)
 
@@ -594,6 +597,11 @@ enum eUserpref_TempSpaceDisplayType : char {
 #  define USER_BORDER_WIDTH_DEFAULT 4
 #  define USER_PRESSURE_THRESHOLD_MAX_DEFAULT USER_PRESSURE_THRESHOLD_MAX_ANDROID
 #  define USER_PRESSURE_SOFTNESS_DEFAULT 0.0f
+/* A 4GB device is killed by the low memory killer long before a desktop would swap: cap
+ * GPU texture size, and keep sculpt and edit mode undo, which copies whole meshes, bounded. */
+#  define USER_GL_RES_LIMIT_DEFAULT 1024
+#  define USER_UNDO_STEPS_DEFAULT 16
+#  define USER_UNDO_MEMORY_DEFAULT 512
 #else
 #  define USER_RENDER_DISPLAY_DEFAULT USER_RENDER_DISPLAY_WINDOW
 #  define USER_TEMP_SPACE_DISPLAY_DEFAULT USER_TEMP_SPACE_DISPLAY_WINDOW
@@ -601,6 +609,9 @@ enum eUserpref_TempSpaceDisplayType : char {
 #  define USER_BORDER_WIDTH_DEFAULT 2
 #  define USER_PRESSURE_THRESHOLD_MAX_DEFAULT 1.0f
 #  define USER_PRESSURE_SOFTNESS_DEFAULT 0.0f
+#  define USER_GL_RES_LIMIT_DEFAULT 0
+#  define USER_UNDO_STEPS_DEFAULT 32
+#  define USER_UNDO_MEMORY_DEFAULT 0
 #endif
 
 enum eUserpref_EmulateMMBMod : char {
@@ -622,6 +633,14 @@ enum eUserpref_DiskCacheCompression : char {
 enum eUserpref_SeqProxySetup : short {
   USER_SEQ_PROXY_SETUP_MANUAL = 0,
   USER_SEQ_PROXY_SETUP_AUTOMATIC = 1,
+};
+
+enum eUserpref_VideoDecodingDevice : short {
+  USER_VIDEO_DECODING_DEVICE_AUTOMATIC = 0,
+  USER_VIDEO_DECODING_DEVICE_VIDEOTOOLBOX = 1,
+  USER_VIDEO_DECODING_DEVICE_D3D11VA = 2,
+  USER_VIDEO_DECODING_DEVICE_CUDA = 3,
+  USER_VIDEO_DECODING_DEVICE_VULKAN = 4,
 };
 
 enum eUserpref_SeqEditorFlags : int {
@@ -750,17 +769,15 @@ struct bUserAssetLibrary {
    * UUIDs to files. (If it is invalid it is up to the end user to fix it.
    */
   char *invalid_uuid = nullptr;
+  /**
+   * The `{repo_module}.{pkg_id}` of the extension defining this library
+   * (see #bUserExtensionRepo::module), empty for libraries the user defined.
+   */
+  char extension_id[128] = "";
 
   short import_method = ASSET_IMPORT_PACK;  /* eAssetImportMethod */
   short flag = ASSET_LIBRARY_RELATIVE_PATH; /* eAssetLibrary_Flag */
   char _pad0[4] = {};
-
-#ifdef __cplusplus
-  bool is_enabled() const
-  {
-    return (this->flag & ASSET_LIBRARY_DISABLED) == 0;
-  }
-#endif
 };
 
 enum eUserExtensionRepo_Flag : uint8_t {
@@ -771,6 +788,16 @@ enum eUserExtensionRepo_Flag : uint8_t {
   USER_EXTENSION_REPO_FLAG_USE_REMOTE_URL = 1 << 3,
   USER_EXTENSION_REPO_FLAG_SYNC_ON_STARTUP = 1 << 4,
   USER_EXTENSION_REPO_FLAG_USE_ACCESS_TOKEN = 1 << 5,
+  /** Collapse the repository's asset libraries in the preferences list. */
+  USER_EXTENSION_REPO_FLAG_ASSET_LIBRARIES_COLLAPSED = 1 << 6,
+  /**
+   * The access token is used by asset libraries from this repository.
+   *
+   * \note This is a cache of `assetlib_auth_method` from the repository listing (`index.json`)
+   * which the extension system updates when syncing, kept for convenience so the UI can
+   * show it without reading the listing.
+   */
+  USER_EXTENSION_REPO_FLAG_USE_ACCESS_TOKEN_ASSET_LIBRARIES = 1 << 7,
 };
 ENUM_OPERATORS(eUserExtensionRepo_Flag)
 
@@ -907,9 +934,10 @@ struct UserDef_SpaceData {
  * #UserDef_SpaceData.)
  */
 struct UserDef_FileSpaceData {
-  eFileDisplayType display_type = FILE_VERTICALDISPLAY; /* FileSelectParams.display */
-  eFileSortType sort_type = FILE_SORT_ALPHA;            /* FileSelectParams.sort */
-  int thumbnail_size = 96;                              /* FileSelectParams.thumbnail_size */
+  /* Android: thumbnails suit a touch screen better than the list. */
+  eFileDisplayType display_type = FILE_IMGDISPLAY; /* FileSelectParams.display */
+  eFileSortType sort_type = FILE_SORT_ALPHA;       /* FileSelectParams.sort */
+  int thumbnail_size = 96;                         /* FileSelectParams.thumbnail_size */
   eFileDetails details_flags = FILE_DETAILS_SIZE |
                                FILE_DETAILS_DATETIME; /* FileSelectParams.details_flags */
   char _pad[5] = {};
@@ -932,7 +960,7 @@ struct UserDef_TempWinBounds {
  * or the #USER_DEVELOPER_TOOL_TEST() macro.
  */
 struct UserDef_Experimental {
-  /** Debug options, always available. */
+  /* Debug options, always available. */
   char use_undo_legacy = 0;
   char no_override_auto_resync = 0;
   char use_cycles_debug = 0;
@@ -946,11 +974,10 @@ struct UserDef_Experimental {
   char write_legacy_blend_file_format = 0;
   char no_data_block_packing = 0;
   char use_paint_debug = 0;
+  char use_video_decoding_debug = 0;
   char SANITIZE_AFTER_HERE = {};
-  /**
-   * The following options are automatically sanitized (set to 0)
-   * when the release cycle is not alpha.
-   */
+  /* The following options are automatically sanitized (set to 0)
+   * when the release cycle is not alpha. */
   char use_new_curves_tools = 0;
   char use_extended_asset_browser = 0;
   char use_3d_texture_paint = 0;
@@ -960,7 +987,6 @@ struct UserDef_Experimental {
    * actually remove this flag is tracked in #158903.
    */
   char use_remote_asset_libraries = 1;
-  char use_collection_importer = 0;
   char _pad[4] = {};
 };
 
@@ -1184,8 +1210,8 @@ struct UserDef {
 
   char _pad14[1] = {};
 
-  short undosteps = 32;
-  int undomemory = 0;
+  short undosteps = USER_UNDO_STEPS_DEFAULT;
+  int undomemory = USER_UNDO_MEMORY_DEFAULT;
   DNA_DEPRECATED float gpu_viewport_quality = 0;
   short gp_manhattandist = 1, gp_euclideandist = 2, gp_eraser = 25;
   eGP_UserdefSettings gp_settings = {};
@@ -1220,7 +1246,7 @@ struct UserDef {
   short recent_files = 200;
   /** Milliseconds to spend spinning the view. */
   short smooth_viewtx = 200;
-  short glreslimit = 1024;
+  short glreslimit = USER_GL_RES_LIMIT_DEFAULT;
   eColorPicker_Types color_picker_type = USER_CP_CIRCLE_HSV;
   /** Curve smoothing type for newly added F-Curves. */
   eFCurve_Smoothing auto_smoothing_new = FCURVE_SMOOTH_CONT_ACCEL;
@@ -1360,7 +1386,7 @@ struct UserDef {
   float sequencer_default_strip_length = 1.0f;
 
   eUserpref_SeqProxySetup sequencer_proxy_setup = USER_SEQ_PROXY_SETUP_AUTOMATIC;
-  short _pad1 = {};
+  eUserpref_VideoDecodingDevice video_decoding_device = USER_VIDEO_DECODING_DEVICE_AUTOMATIC;
 
   float collection_instance_empty_size = 1.0f;
   eTextEdit_Flags text_flag = {};

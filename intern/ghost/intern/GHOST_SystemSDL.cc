@@ -6,7 +6,9 @@
  * \ingroup GHOST
  */
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 
@@ -24,13 +26,49 @@
 #include "GHOST_EventButton.hh"
 #include "GHOST_EventCursor.hh"
 #include "GHOST_EventKey.hh"
+#include "GHOST_EventManager.hh"
+#include "GHOST_EventString.hh"
+#include "GHOST_EventTouch.hh"
+#include "GHOST_EventTrackpad.hh"
 #include "GHOST_EventWheel.hh"
 
 GHOST_SystemSDL::GHOST_SystemSDL() : GHOST_System()
 {
+#ifdef __ANDROID__
+  /* Handle touchscreen input explicitly. SDL's mouse emulation retains a hover position after
+   * the finger is lifted, which does not match touch interaction. Disable the inverse conversion
+   * too, so input from a physical mouse is not translated back into touch events. */
+  if (!SDL_SetHintWithPriority(SDL_HINT_TOUCH_MOUSE_EVENTS, "0", SDL_HINT_OVERRIDE) ||
+      !SDL_SetHintWithPriority(SDL_HINT_MOUSE_TOUCH_EVENTS, "0", SDL_HINT_OVERRIDE))
+  {
+    throw std::runtime_error(SDL_GetError());
+  }
+#endif
+
+  /* SDL's pen mouse emulation updates the state read by getCursorPosition() and getButtons().
+   * Keep it enabled for those queries, but discard its mouse events since we handle pen events
+   * directly. Disable pen touch emulation to avoid duplicate input. */
+  if (!SDL_SetHintWithPriority(SDL_HINT_PEN_MOUSE_EVENTS, "1", SDL_HINT_OVERRIDE) ||
+      !SDL_SetHintWithPriority(SDL_HINT_PEN_TOUCH_EVENTS, "0", SDL_HINT_OVERRIDE))
+  {
+    throw std::runtime_error(SDL_GetError());
+  }
   if (!SDL_Init(SDL_INIT_VIDEO)) {
     throw std::runtime_error(SDL_GetError());
   }
+
+#ifdef WITH_VULKAN_BACKEND
+  vulkan_surface_recreation_event_ = SDL_RegisterEvents(1);
+  if (vulkan_surface_recreation_event_ == 0 || !SDL_AddEventWatch(vulkanLifecycleEventWatch, this))
+  {
+    throw std::runtime_error(SDL_GetError());
+  }
+#endif
+#ifdef __ANDROID__
+  if (!SDL_AddEventWatch(backgroundEventWatch, this)) {
+    throw std::runtime_error(SDL_GetError());
+  }
+#endif
 
   SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
   SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
@@ -41,8 +79,44 @@ GHOST_SystemSDL::GHOST_SystemSDL() : GHOST_System()
 
 GHOST_SystemSDL::~GHOST_SystemSDL()
 {
+#ifdef WITH_VULKAN_BACKEND
+  SDL_RemoveEventWatch(vulkanLifecycleEventWatch, this);
+#endif
+#ifdef __ANDROID__
+  SDL_RemoveEventWatch(backgroundEventWatch, this);
+#endif
   SDL_Quit();
 }
+
+#ifdef WITH_VULKAN_BACKEND
+bool SDLCALL GHOST_SystemSDL::vulkanLifecycleEventWatch(void *userdata, SDL_Event *event)
+{
+  if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+    GHOST_SystemSDL *system = static_cast<GHOST_SystemSDL *>(userdata);
+    SDL_Event recreate_surface_event = {};
+    recreate_surface_event.type = system->vulkan_surface_recreation_event_;
+    SDL_PushEvent(&recreate_surface_event);
+  }
+  return true;
+}
+#endif
+
+#ifdef __ANDROID__
+bool SDLCALL GHOST_SystemSDL::backgroundEventWatch(void *userdata, SDL_Event *event)
+{
+  /* SDL sends this from its event pump on the main thread, then blocks until the app resumes,
+   * so a queued event would only be seen after resuming, if the process survives at all.
+   * Dispatch it right away instead. */
+  if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND && SDL_IsMainThread()) {
+    GHOST_SystemSDL *system = static_cast<GHOST_SystemSDL *>(userdata);
+    const GHOST_Event background_event(system->getMilliSeconds(),
+                                       GHOST_kEventApplicationWillEnterBackground,
+                                       system->window_manager_->getActiveWindow());
+    system->getEventManager()->dispatchEvent(&background_event);
+  }
+  return true;
+}
+#endif
 
 GHOST_IWindow *GHOST_SystemSDL::createWindow(const char *title,
                                              int32_t left,
@@ -471,9 +545,604 @@ static SDL_Window *SDL_GetWindowFromID_fallback(SDL_WindowID id)
   return sdl_win;
 }
 
+#ifdef __ANDROID__
+void GHOST_SystemSDL::processTouchEvent(const SDL_TouchFingerEvent &sdl_sub_evt)
+{
+  /* SDL identifies touch events synthesized from pen and mouse input explicitly. Their original
+   * events are handled separately and must not start a second gesture. */
+  if (sdl_sub_evt.touchID == SDL_PEN_TOUCHID || sdl_sub_evt.touchID == SDL_MOUSE_TOUCHID) {
+    return;
+  }
+
+  const uint64_t event_ms = SDL_NS_TO_MS(sdl_sub_evt.timestamp);
+  const bool is_down = sdl_sub_evt.type == SDL_EVENT_FINGER_DOWN;
+  const bool is_motion = sdl_sub_evt.type == SDL_EVENT_FINGER_MOTION;
+  const bool is_up = sdl_sub_evt.type == SDL_EVENT_FINGER_UP;
+  const bool is_canceled = sdl_sub_evt.type == SDL_EVENT_FINGER_CANCELED;
+
+  /* Captured contacts do not participate in mouse emulation or gesture recognition. */
+  auto captured = std::find_if(
+      captured_touches_.begin(), captured_touches_.end(), [&](const CapturedTouch &touch) {
+        return touch.touch_id == sdl_sub_evt.touchID && touch.finger_id == sdl_sub_evt.fingerID;
+      });
+  if (is_down && captured != captured_touches_.end()) {
+    /* A reused ID must also cancel the previous contact in the application. */
+    if (GHOST_WindowSDL *window = findGhostWindow(SDL_GetWindowFromID(captured->window_id))) {
+      pushEvent(std::make_unique<GHOST_EventTouch>(
+          event_ms,
+          window,
+          GHOST_TEventTouchData{
+              captured->touch_id, captured->finger_id, 0, 0, GHOST_TTouchPhase::Cancel}));
+    }
+    captured_touches_.erase(captured);
+    captured = captured_touches_.end();
+  }
+  SDL_Window *capture_sdl_window = captured != captured_touches_.end() ?
+                                       SDL_GetWindowFromID(captured->window_id) :
+                                       SDL_GetWindowFromID_fallback(sdl_sub_evt.windowID);
+  GHOST_WindowSDL *capture_window = findGhostWindow(capture_sdl_window);
+  int capture_width = 0, capture_height = 0;
+  if (capture_sdl_window) {
+    SDL_GetWindowSize(capture_sdl_window, &capture_width, &capture_height);
+  }
+  const int capture_x = int(sdl_sub_evt.x * capture_width);
+  const int capture_y = int(sdl_sub_evt.y * capture_height);
+  if (is_down && capture_window && capture_window->shouldCaptureTouch(capture_x, capture_y)) {
+    captured_touches_.push_back(
+        {sdl_sub_evt.touchID, sdl_sub_evt.fingerID, SDL_GetWindowID(capture_sdl_window)});
+    captured = std::prev(captured_touches_.end());
+  }
+  if (captured != captured_touches_.end()) {
+    if (capture_window) {
+      const GHOST_TTouchPhase phase = is_down   ? GHOST_TTouchPhase::Down :
+                                      is_motion ? GHOST_TTouchPhase::Motion :
+                                      is_up     ? GHOST_TTouchPhase::Up :
+                                                  GHOST_TTouchPhase::Cancel;
+      pushEvent(std::make_unique<GHOST_EventTouch>(
+          event_ms,
+          capture_window,
+          GHOST_TEventTouchData{
+              sdl_sub_evt.touchID, sdl_sub_evt.fingerID, capture_x, capture_y, phase}));
+    }
+    if (is_up || is_canceled) {
+      captured_touches_.erase(captured);
+    }
+    return;
+  }
+
+  auto reset_touch_state = [this]() {
+    active_touches_.clear();
+    touch_gesture_mode_ = TouchGestureMode::None;
+    primary_touch_window_id_ = 0;
+    multi_finger_tap_start_time_ms_ = 0;
+    multi_finger_tap_count_ = 0;
+    touch_start_x_ = 0.0f;
+    touch_start_y_ = 0.0f;
+    touch_previous_x_ = 0.0f;
+    touch_previous_y_ = 0.0f;
+    touch_previous_distance_ = 0.0f;
+    touch_previous_angle_ = 0.0f;
+  };
+
+  auto find_touch = [&]() {
+    return std::find_if(
+        active_touches_.begin(), active_touches_.end(), [&](const TouchPoint &touch) {
+          return touch.touch_id == sdl_sub_evt.touchID && touch.finger_id == sdl_sub_evt.fingerID;
+        });
+  };
+
+  if (is_down) {
+    if (find_touch() != active_touches_.end()) {
+      return;
+    }
+    if (active_touches_.empty()) {
+      primary_touch_window_id_ = sdl_sub_evt.windowID;
+      multi_finger_tap_start_time_ms_ = event_ms;
+    }
+  }
+  else if (find_touch() == active_touches_.end()) {
+    return;
+  }
+
+  SDL_Window *sdl_win = SDL_GetWindowFromID_fallback(primary_touch_window_id_);
+  GHOST_WindowSDL *window = findGhostWindow(sdl_win);
+  if (window == nullptr) {
+    reset_touch_state();
+    return;
+  }
+
+  int x_win, y_win, width, height;
+  SDL_GetWindowPosition(sdl_win, &x_win, &y_win);
+  SDL_GetWindowSize(sdl_win, &width, &height);
+
+  /* Allow normal tap jitter without delaying the start of precision drags too much. This is 15
+   * pixels at Android's 288 DPI. */
+  constexpr float drag_threshold_points = 5.0f;
+  constexpr uint64_t multi_finger_tap_timeout_ms = 500;
+  const float drag_threshold = std::max(
+      drag_threshold_points,
+      drag_threshold_points * static_cast<GHOST_IWindow *>(window)->getDPIHint() / 96.0f);
+
+  auto set_cursor = [&](const float x, const float y) {
+    use_touch_cursor_position_ = true;
+    touch_cursor_x_ = int32_t(x * width) + x_win;
+    touch_cursor_y_ = int32_t(y * height) + y_win;
+  };
+  auto push_cursor = [&](const bool is_touch_drag = false) {
+    const int32_t touch_start_x = int32_t(touch_start_x_ * width) + x_win;
+    const int32_t touch_start_y = int32_t(touch_start_y_ * height) + y_win;
+    pushEvent(std::make_unique<GHOST_EventCursor>(event_ms,
+                                                  GHOST_kEventCursorMove,
+                                                  window,
+                                                  touch_cursor_x_,
+                                                  touch_cursor_y_,
+                                                  GHOST_TABLET_DATA_NONE,
+                                                  is_touch_drag,
+                                                  touch_start_x,
+                                                  touch_start_y,
+                                                  true));
+  };
+  auto push_touch_button = [&](const GHOST_TEventType type, const bool is_touch_drag) {
+    const int32_t touch_start_x = int32_t(touch_start_x_ * width) + x_win;
+    const int32_t touch_start_y = int32_t(touch_start_y_ * height) + y_win;
+    pushEvent(std::make_unique<GHOST_EventButton>(event_ms,
+                                                  type,
+                                                  window,
+                                                  GHOST_kButtonMaskLeft,
+                                                  GHOST_TABLET_DATA_NONE,
+                                                  true,
+                                                  is_touch_drag,
+                                                  touch_start_x,
+                                                  touch_start_y));
+  };
+  auto push_trackpad = [&](const GHOST_TTrackpadEventSubTypes subtype,
+                           const int32_t delta_x,
+                           const int32_t delta_y,
+                           const bool inverted,
+                           const uint8_t num_fingers) {
+    /* Keep the event over the region where the gesture began. Trackpad gestures are dispatched
+     * based on their event position, so following the finger across an editor boundary could
+     * otherwise start an operation in a different editor. */
+    const int32_t event_x = int32_t(touch_start_x_ * width) + x_win;
+    const int32_t event_y = int32_t(touch_start_y_ * height) + y_win;
+    pushEvent(std::make_unique<GHOST_EventTrackpad>(
+        event_ms, window, subtype, event_x, event_y, delta_x, delta_y, inverted, num_fingers));
+  };
+  auto begin_two_finger_gesture = [&](const TouchGestureMode mode) {
+    touch_gesture_mode_ = mode;
+    touch_start_x_ = touch_previous_x_ = (active_touches_[0].x + active_touches_[1].x) * 0.5f;
+    touch_start_y_ = touch_previous_y_ = (active_touches_[0].y + active_touches_[1].y) * 0.5f;
+    const float distance_x = (active_touches_[1].x - active_touches_[0].x) * width;
+    const float distance_y = (active_touches_[1].y - active_touches_[0].y) * height;
+    touch_previous_distance_ = std::sqrt(distance_x * distance_x + distance_y * distance_y);
+    touch_previous_angle_ = std::atan2(distance_y, distance_x);
+    set_cursor(touch_start_x_, touch_start_y_);
+  };
+  auto multi_finger_tap_is_valid = [&]() {
+    if (event_ms - multi_finger_tap_start_time_ms_ > multi_finger_tap_timeout_ms) {
+      return false;
+    }
+    for (const TouchPoint &touch : active_touches_) {
+      const float delta_x = (touch.x - touch.start_x) * width;
+      const float delta_y = (touch.y - touch.start_y) * height;
+      if (delta_x * delta_x + delta_y * delta_y >= drag_threshold * drag_threshold) {
+        return false;
+      }
+    }
+    return true;
+  };
+  auto suppress_touch_gesture = [&]() {
+    if (touch_gesture_mode_ != TouchGestureMode::Suppressed) {
+      pushEvent(std::make_unique<GHOST_Event>(event_ms, GHOST_kEventCursorHoverClear, window));
+    }
+    touch_gesture_mode_ = TouchGestureMode::Suppressed;
+  };
+  if (is_down) {
+    const TouchGestureMode previous_gesture_mode = touch_gesture_mode_;
+    const bool same_device_and_window = active_touches_.empty() ||
+                                        (active_touches_.front().touch_id == sdl_sub_evt.touchID &&
+                                         primary_touch_window_id_ == sdl_sub_evt.windowID);
+    active_touches_.push_back({sdl_sub_evt.touchID,
+                               sdl_sub_evt.fingerID,
+                               sdl_sub_evt.x,
+                               sdl_sub_evt.y,
+                               sdl_sub_evt.x,
+                               sdl_sub_evt.y});
+
+    if (active_touches_.size() == 1) {
+      touch_gesture_mode_ = TouchGestureMode::TapPending;
+      touch_start_x_ = touch_previous_x_ = sdl_sub_evt.x;
+      touch_start_y_ = touch_previous_y_ = sdl_sub_evt.y;
+      set_cursor(sdl_sub_evt.x, sdl_sub_evt.y);
+    }
+    else if (previous_gesture_mode == TouchGestureMode::MultiFingerTapPending) {
+      /* Replacing an already released finger does not extend the same tap. */
+      if (same_device_and_window && active_touches_.size() <= 4 &&
+          active_touches_.size() == multi_finger_tap_count_ + 1)
+      {
+        multi_finger_tap_count_ = uint8_t(active_touches_.size());
+        touch_start_x_ = 0.0f;
+        touch_start_y_ = 0.0f;
+        for (const TouchPoint &touch : active_touches_) {
+          touch_start_x_ += touch.x;
+          touch_start_y_ += touch.y;
+        }
+        touch_start_x_ /= active_touches_.size();
+        touch_start_y_ /= active_touches_.size();
+        set_cursor(touch_start_x_, touch_start_y_);
+      }
+      else {
+        suppress_touch_gesture();
+      }
+    }
+    else if (active_touches_.size() == 2 && same_device_and_window) {
+      if (previous_gesture_mode == TouchGestureMode::OneFingerDrag) {
+        push_touch_button(GHOST_kEventButtonUp, true);
+      }
+      if (previous_gesture_mode == TouchGestureMode::TapPending) {
+        multi_finger_tap_count_ = 2;
+        begin_two_finger_gesture(TouchGestureMode::MultiFingerTapPending);
+      }
+      else {
+        begin_two_finger_gesture(TouchGestureMode::TwoFingerNavigation);
+      }
+    }
+    else {
+      if (previous_gesture_mode == TouchGestureMode::OneFingerDrag) {
+        push_touch_button(GHOST_kEventButtonUp, true);
+      }
+      suppress_touch_gesture();
+    }
+    return;
+  }
+
+  auto touch = find_touch();
+
+  if (is_motion) {
+    touch->x = sdl_sub_evt.x;
+    touch->y = sdl_sub_evt.y;
+
+    if (touch_gesture_mode_ == TouchGestureMode::TapPending) {
+      set_cursor(touch->x, touch->y);
+      const float delta_x = (touch->x - touch_start_x_) * width;
+      const float delta_y = (touch->y - touch_start_y_) * height;
+
+      if (delta_x * delta_x + delta_y * delta_y >= drag_threshold * drag_threshold) {
+        touch_gesture_mode_ = TouchGestureMode::OneFingerDrag;
+        const int32_t delta_x_int = int32_t(delta_x);
+        const int32_t delta_y_int = int32_t(delta_y);
+        const int32_t current_x = touch_cursor_x_;
+        const int32_t current_y = touch_cursor_y_;
+        set_cursor(touch_start_x_, touch_start_y_);
+        push_cursor(true);
+        push_touch_button(GHOST_kEventButtonDown, true);
+        touch_cursor_x_ = current_x;
+        touch_cursor_y_ = current_y;
+        push_cursor(true);
+        if (delta_x_int != 0 || delta_y_int != 0) {
+          push_trackpad(GHOST_kTrackpadEventScroll, delta_x_int, delta_y_int, false, 1);
+        }
+        touch_previous_x_ = touch->x;
+        touch_previous_y_ = touch->y;
+      }
+      return;
+    }
+
+    if (touch_gesture_mode_ == TouchGestureMode::MultiFingerTapPending) {
+      if (multi_finger_tap_is_valid()) {
+        return;
+      }
+      if (multi_finger_tap_count_ == 2 && active_touches_.size() == 2) {
+        touch_gesture_mode_ = TouchGestureMode::TwoFingerNavigation;
+      }
+      else {
+        suppress_touch_gesture();
+        return;
+      }
+    }
+
+    if (touch_gesture_mode_ == TouchGestureMode::OneFingerDrag ||
+        touch_gesture_mode_ == TouchGestureMode::OneFingerTrackpadOnly)
+    {
+      set_cursor(touch->x, touch->y);
+      const int32_t delta_x = int32_t((touch->x - touch_previous_x_) * width);
+      const int32_t delta_y = int32_t((touch->y - touch_previous_y_) * height);
+      if (touch_gesture_mode_ == TouchGestureMode::OneFingerDrag) {
+        push_cursor(true);
+      }
+      if (delta_x != 0 || delta_y != 0) {
+        push_trackpad(GHOST_kTrackpadEventScroll, delta_x, delta_y, false, 1);
+        touch_previous_x_ = touch->x;
+        touch_previous_y_ = touch->y;
+      }
+    }
+    else if (touch_gesture_mode_ == TouchGestureMode::TwoFingerNavigation &&
+             active_touches_.size() == 2)
+    {
+      const float centroid_x = (active_touches_[0].x + active_touches_[1].x) * 0.5f;
+      const float centroid_y = (active_touches_[0].y + active_touches_[1].y) * 0.5f;
+      set_cursor(centroid_x, centroid_y);
+      const int32_t delta_x = int32_t((centroid_x - touch_previous_x_) * width);
+      const int32_t delta_y = int32_t((centroid_y - touch_previous_y_) * height);
+      if (delta_x != 0 || delta_y != 0) {
+        push_trackpad(GHOST_kTrackpadEventScroll, delta_x, delta_y, true, 2);
+        touch_previous_x_ = centroid_x;
+        touch_previous_y_ = centroid_y;
+      }
+
+      const float distance_x = (active_touches_[1].x - active_touches_[0].x) * width;
+      const float distance_y = (active_touches_[1].y - active_touches_[0].y) * height;
+      const float distance = std::sqrt(distance_x * distance_x + distance_y * distance_y);
+      const int32_t distance_delta = int32_t(distance - touch_previous_distance_);
+      if (distance_delta != 0) {
+        push_trackpad(GHOST_kTrackpadEventMagnify, distance_delta, 0, false, 2);
+        /* Retain the fractional remainder so slow pinches still accumulate into smooth events. */
+        touch_previous_distance_ += distance_delta;
+      }
+
+      /* Match Cocoa's TrackpadEventRotate events (five units per degree, clockwise positive). */
+      constexpr float rotation_scale = 5.0f * 180.0f / float(M_PI);
+      const float angle = std::atan2(distance_y, distance_x);
+      const float angle_delta = std::remainder(angle - touch_previous_angle_, float(2.0 * M_PI));
+      const int32_t rotation_delta = int32_t(angle_delta * rotation_scale);
+      if (rotation_delta != 0) {
+        push_trackpad(GHOST_kTrackpadEventRotate, rotation_delta, 0, false, 2);
+        /* Retain fractional rotation and wrap when crossing the -pi/pi boundary. */
+        touch_previous_angle_ = std::remainder(
+            touch_previous_angle_ + rotation_delta / rotation_scale, float(2.0 * M_PI));
+      }
+    }
+    return;
+  }
+
+  if (!is_up && !is_canceled) {
+    return;
+  }
+
+  touch->x = sdl_sub_evt.x;
+  touch->y = sdl_sub_evt.y;
+
+  if (touch_gesture_mode_ == TouchGestureMode::MultiFingerTapPending) {
+    if (!is_canceled && multi_finger_tap_is_valid()) {
+      active_touches_.erase(touch);
+      if (active_touches_.empty()) {
+        GHOST_TEventType tap_event_type = GHOST_kEventUnknown;
+        switch (multi_finger_tap_count_) {
+          case 2:
+            tap_event_type = GHOST_kEventTwoFingerTap;
+            break;
+          case 3:
+            tap_event_type = GHOST_kEventThreeFingerTap;
+            break;
+          case 4:
+            tap_event_type = GHOST_kEventFourFingerTap;
+            break;
+          default:
+            break;
+        }
+        if (tap_event_type != GHOST_kEventUnknown) {
+          set_cursor(touch_start_x_, touch_start_y_);
+          push_cursor();
+          pushEvent(std::make_unique<GHOST_Event>(event_ms, tap_event_type, window));
+        }
+        pushEvent(std::make_unique<GHOST_Event>(event_ms, GHOST_kEventCursorHoverClear, window));
+        reset_touch_state();
+      }
+      return;
+    }
+    if (is_canceled) {
+      suppress_touch_gesture();
+    }
+    else if (multi_finger_tap_count_ == 2 && active_touches_.size() == 2) {
+      touch_gesture_mode_ = TouchGestureMode::TwoFingerNavigation;
+    }
+    else {
+      suppress_touch_gesture();
+    }
+  }
+
+  if (touch_gesture_mode_ == TouchGestureMode::TapPending && active_touches_.size() == 1) {
+    set_cursor(touch->x, touch->y);
+    if (!is_canceled) {
+      push_cursor();
+      push_touch_button(GHOST_kEventButtonDown, false);
+      push_touch_button(GHOST_kEventButtonUp, false);
+    }
+    pushEvent(std::make_unique<GHOST_Event>(event_ms, GHOST_kEventCursorHoverClear, window));
+    reset_touch_state();
+    return;
+  }
+
+  if ((touch_gesture_mode_ == TouchGestureMode::OneFingerDrag ||
+       touch_gesture_mode_ == TouchGestureMode::OneFingerTrackpadOnly) &&
+      active_touches_.size() == 1)
+  {
+    set_cursor(touch->x, touch->y);
+    if (!is_canceled) {
+      if (touch_gesture_mode_ == TouchGestureMode::OneFingerDrag) {
+        push_cursor(true);
+      }
+      const int32_t delta_x = int32_t((touch->x - touch_previous_x_) * width);
+      const int32_t delta_y = int32_t((touch->y - touch_previous_y_) * height);
+      if (delta_x != 0 || delta_y != 0) {
+        push_trackpad(GHOST_kTrackpadEventScroll, delta_x, delta_y, false, 1);
+      }
+    }
+    if (touch_gesture_mode_ == TouchGestureMode::OneFingerDrag) {
+      push_touch_button(GHOST_kEventButtonUp, true);
+    }
+    pushEvent(std::make_unique<GHOST_Event>(event_ms, GHOST_kEventCursorHoverClear, window));
+    reset_touch_state();
+    return;
+  }
+
+  if (touch_gesture_mode_ == TouchGestureMode::TwoFingerNavigation) {
+    if (!is_canceled && active_touches_.size() == 2) {
+      active_touches_.erase(touch);
+      const TouchPoint &remaining_touch = active_touches_.front();
+      /* Continue with one-finger trackpad motion without pressing the synthetic mouse button.
+       * A button press here could activate a gizmo or widget underneath the remaining finger. */
+      touch_gesture_mode_ = TouchGestureMode::OneFingerTrackpadOnly;
+      touch_previous_x_ = remaining_touch.x;
+      touch_previous_y_ = remaining_touch.y;
+      touch_previous_distance_ = 0.0f;
+      touch_previous_angle_ = 0.0f;
+      set_cursor(remaining_touch.x, remaining_touch.y);
+      return;
+    }
+    const float centroid_x = (active_touches_[0].x + active_touches_[1].x) * 0.5f;
+    const float centroid_y = (active_touches_[0].y + active_touches_[1].y) * 0.5f;
+    set_cursor(centroid_x, centroid_y);
+    pushEvent(std::make_unique<GHOST_Event>(event_ms, GHOST_kEventCursorHoverClear, window));
+    touch_gesture_mode_ = TouchGestureMode::Suppressed;
+  }
+
+  active_touches_.erase(touch);
+  if (active_touches_.empty()) {
+    reset_touch_state();
+  }
+}
+#endif
+
+void GHOST_SystemSDL::processPenEvent(const SDL_Event &sdl_event)
+{
+  GHOST_TabletData &tablet = pen_tablet_data_;
+
+  if (sdl_event.type == SDL_EVENT_PEN_PROXIMITY_IN ||
+      sdl_event.type == SDL_EVENT_PEN_PROXIMITY_OUT)
+  {
+    if (sdl_event.type == SDL_EVENT_PEN_PROXIMITY_OUT) {
+      const SDL_PenProximityEvent &event = sdl_event.pproximity;
+      GHOST_IWindow *window = nullptr;
+      if (event.windowID) {
+        window = findGhostWindow(SDL_GetWindowFromID(event.windowID));
+      }
+      else if (!window_manager_->getWindows().empty()) {
+        window = window_manager_->getWindows().front();
+      }
+      if (window) {
+        pushEvent(std::make_unique<GHOST_Event>(
+            SDL_NS_TO_MS(event.timestamp), GHOST_kEventCursorHoverClear, window));
+      }
+    }
+    tablet = {};
+    return;
+  }
+
+  SDL_Window *sdl_win = SDL_GetWindowFromEvent(&sdl_event);
+  GHOST_WindowSDL *window = findGhostWindow(sdl_win);
+  if (window == nullptr) {
+    return;
+  }
+
+#ifdef __ANDROID__
+  use_touch_cursor_position_ = false;
+#endif
+
+  int x_win, y_win;
+  SDL_GetWindowPosition(sdl_win, &x_win, &y_win);
+
+  auto push_cursor = [&](const auto &event) {
+    pushEvent(std::make_unique<GHOST_EventCursor>(SDL_NS_TO_MS(event.timestamp),
+                                                  GHOST_kEventCursorMove,
+                                                  window,
+                                                  int32_t(event.x) + x_win,
+                                                  int32_t(event.y) + y_win,
+                                                  tablet));
+  };
+
+  switch (sdl_event.type) {
+    case SDL_EVENT_PEN_AXIS: {
+      const SDL_PenAxisEvent &event = sdl_event.paxis;
+      switch (event.axis) {
+        case SDL_PEN_AXIS_PRESSURE:
+          tablet.Pressure = std::clamp(event.value, 0.0f, 1.0f);
+          break;
+        case SDL_PEN_AXIS_XTILT:
+          tablet.Xtilt = std::clamp(event.value / 90.0f, -1.0f, 1.0f);
+          break;
+        case SDL_PEN_AXIS_YTILT:
+          tablet.Ytilt = std::clamp(event.value / 90.0f, -1.0f, 1.0f);
+          break;
+        default:
+          return;
+      }
+      tablet.Active = (event.pen_state & SDL_PEN_INPUT_ERASER_TIP) ? GHOST_kTabletModeEraser :
+                                                                     GHOST_kTabletModeStylus;
+      /* Pressure and tilt can change without cursor motion. */
+      push_cursor(event);
+      break;
+    }
+    case SDL_EVENT_PEN_MOTION: {
+      const SDL_PenMotionEvent &event = sdl_event.pmotion;
+      tablet.Active = (event.pen_state & SDL_PEN_INPUT_ERASER_TIP) ? GHOST_kTabletModeEraser :
+                                                                     GHOST_kTabletModeStylus;
+      push_cursor(event);
+      break;
+    }
+    case SDL_EVENT_PEN_DOWN:
+    case SDL_EVENT_PEN_UP: {
+      const SDL_PenTouchEvent &event = sdl_event.ptouch;
+      tablet.Active = event.eraser ? GHOST_kTabletModeEraser : GHOST_kTabletModeStylus;
+      if (!event.down) {
+        tablet.Pressure = 0.0f;
+      }
+      /* Update the cursor before the button event, which has no coordinates of its own. */
+      push_cursor(event);
+      pushEvent(std::make_unique<GHOST_EventButton>(SDL_NS_TO_MS(event.timestamp),
+                                                    event.down ? GHOST_kEventButtonDown :
+                                                                 GHOST_kEventButtonUp,
+                                                    window,
+                                                    GHOST_kButtonMaskLeft,
+                                                    tablet));
+      break;
+    }
+    case SDL_EVENT_PEN_BUTTON_DOWN:
+    case SDL_EVENT_PEN_BUTTON_UP: {
+      const SDL_PenButtonEvent &event = sdl_event.pbutton;
+      /* Match SDL's pen mouse emulation. Button zero is reserved for the pen tip. */
+      static constexpr GHOST_TButton buttons[] = {
+          GHOST_kButtonMaskLeft,
+          GHOST_kButtonMaskRight,
+          GHOST_kButtonMaskMiddle,
+          GHOST_kButtonMaskButton4,
+          GHOST_kButtonMaskButton5,
+      };
+      if (event.button == 0 || event.button >= std::size(buttons)) {
+        break;
+      }
+      tablet.Active = (event.pen_state & SDL_PEN_INPUT_ERASER_TIP) ? GHOST_kTabletModeEraser :
+                                                                     GHOST_kTabletModeStylus;
+      push_cursor(event);
+      pushEvent(std::make_unique<GHOST_EventButton>(SDL_NS_TO_MS(event.timestamp),
+                                                    event.down ? GHOST_kEventButtonDown :
+                                                                 GHOST_kEventButtonUp,
+                                                    window,
+                                                    buttons[event.button],
+                                                    tablet));
+      break;
+    }
+  }
+}
+
 void GHOST_SystemSDL::processEvent(SDL_Event *sdl_event)
 {
   std::unique_ptr<GHOST_Event> g_event = nullptr;
+
+#ifdef WITH_VULKAN_BACKEND
+  if (sdl_event->type == vulkan_surface_recreation_event_) {
+    for (GHOST_IWindow *iwindow : window_manager_->getWindows()) {
+      if (iwindow->getDrawingContextType() == GHOST_kDrawingContextTypeVulkan) {
+        GHOST_WindowSDL *window = static_cast<GHOST_WindowSDL *>(iwindow);
+        GHOST_ContextVK *context = static_cast<GHOST_ContextVK *>(iwindow->getDrawingContext());
+        if (context->recreateSurface() == GHOST_kSuccess) {
+          window->invalidate();
+        }
+      }
+    }
+    return;
+  }
+#endif
 
   switch (sdl_event->type) {
     case SDL_EVENT_WINDOW_EXPOSED:
@@ -520,8 +1189,32 @@ void GHOST_SystemSDL::processEvent(SDL_Event *sdl_event)
       break;
     }
 
+#ifdef __ANDROID__
+    /* Sent by BlenderActivity when a .blend is opened from another app while Blender runs. */
+    case SDL_EVENT_DROP_FILE: {
+      const SDL_DropEvent &sdl_sub_evt = sdl_event->drop;
+      GHOST_IWindow *window = window_manager_->getActiveWindow();
+      if (window && sdl_sub_evt.data && sdl_sub_evt.data[0] != '\0') {
+        g_event = std::make_unique<GHOST_EventString>(SDL_NS_TO_MS(sdl_sub_evt.timestamp),
+                                                      GHOST_kEventOpenMainFile,
+                                                      window,
+                                                      strdup(sdl_sub_evt.data));
+      }
+      break;
+    }
+#endif
+
     case SDL_EVENT_MOUSE_MOTION: {
       const SDL_MouseMotionEvent &sdl_sub_evt = sdl_event->motion;
+      if (sdl_sub_evt.which == SDL_PEN_MOUSEID) {
+        break;
+      }
+#ifdef __ANDROID__
+      if (sdl_sub_evt.which == SDL_TOUCH_MOUSEID) {
+        break;
+      }
+      use_touch_cursor_position_ = false;
+#endif
       const uint64_t event_ms = SDL_NS_TO_MS(sdl_sub_evt.timestamp);
       SDL_Window *sdl_win = SDL_GetWindowFromID_fallback(sdl_sub_evt.windowID);
       GHOST_WindowSDL *window = findGhostWindow(sdl_win);
@@ -589,6 +1282,9 @@ void GHOST_SystemSDL::processEvent(SDL_Event *sdl_event)
     case SDL_EVENT_MOUSE_BUTTON_UP:
     case SDL_EVENT_MOUSE_BUTTON_DOWN: {
       const SDL_MouseButtonEvent &sdl_sub_evt = sdl_event->button;
+      if (sdl_sub_evt.which == SDL_PEN_MOUSEID) {
+        break;
+      }
       const uint64_t event_ms = SDL_NS_TO_MS(sdl_sub_evt.timestamp);
       GHOST_TButton gbmask = GHOST_kButtonMaskLeft;
       GHOST_TEventType type = sdl_sub_evt.down ? GHOST_kEventButtonDown : GHOST_kEventButtonUp;
@@ -638,6 +1334,25 @@ void GHOST_SystemSDL::processEvent(SDL_Event *sdl_event)
       }
       break;
     }
+#ifdef __ANDROID__
+    case SDL_EVENT_FINGER_DOWN:
+    case SDL_EVENT_FINGER_UP:
+    case SDL_EVENT_FINGER_MOTION:
+    case SDL_EVENT_FINGER_CANCELED: {
+      processTouchEvent(sdl_event->tfinger);
+      break;
+    }
+#endif
+    case SDL_EVENT_PEN_PROXIMITY_IN:
+    case SDL_EVENT_PEN_PROXIMITY_OUT:
+    case SDL_EVENT_PEN_DOWN:
+    case SDL_EVENT_PEN_UP:
+    case SDL_EVENT_PEN_MOTION:
+    case SDL_EVENT_PEN_BUTTON_DOWN:
+    case SDL_EVENT_PEN_BUTTON_UP:
+    case SDL_EVENT_PEN_AXIS:
+      processPenEvent(*sdl_event);
+      break;
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
       const SDL_KeyboardEvent &sdl_sub_evt = sdl_event->key;
@@ -686,8 +1401,19 @@ void GHOST_SystemSDL::processEvent(SDL_Event *sdl_event)
 
 GHOST_TSuccess GHOST_SystemSDL::getCursorPosition(int32_t &x, int32_t &y) const
 {
+#ifdef __ANDROID__
+  if (use_touch_cursor_position_) {
+    x = touch_cursor_x_;
+    y = touch_cursor_y_;
+    return GHOST_kSuccess;
+  }
+#endif
+
   int x_win, y_win;
   SDL_Window *win = SDL_GetMouseFocus();
+  if (win == nullptr) {
+    return GHOST_kFailure;
+  }
   SDL_GetWindowPosition(win, &x_win, &y_win);
 
   float xf, yf;
@@ -702,6 +1428,9 @@ GHOST_TSuccess GHOST_SystemSDL::setCursorPosition(int32_t x, int32_t y)
 {
   int x_win, y_win;
   SDL_Window *win = SDL_GetMouseFocus();
+  if (win == nullptr) {
+    return GHOST_kFailure;
+  }
   SDL_GetWindowPosition(win, &x_win, &y_win);
 
   SDL_WarpMouseInWindow(win, x - x_win, y - y_win);
@@ -871,3 +1600,12 @@ uint64_t GHOST_SystemSDL::getMilliSeconds() const
 {
   return SDL_GetTicks();
 }
+
+#ifdef __ANDROID__
+/* Declared by the window manager, which cannot include GHOST's private headers: Python's
+ * `webbrowser` finds no browser on Android, so `WM_OT_platform_url_open` comes here. */
+extern "C" bool GHOST_android_open_url(const char *url)
+{
+  return SDL_OpenURL(url);
+}
+#endif

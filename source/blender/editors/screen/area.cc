@@ -2320,7 +2320,9 @@ void ED_area_update_region_sizes(wmWindowManager *wm, wmWindow *win, ScrArea *ar
     /* Some AZones use View2D data which is only updated in region init, so call that first! */
     region_azones_add(screen, area, &region);
   }
-  ED_area_azones_update(area, win->runtime->eventstate->xy);
+  ED_area_azones_update(area,
+                        win->runtime->eventstate->xy,
+                        win->runtime->cursor_hover_enabled && !win->runtime->cursor_is_touch);
 
   area->flag &= ~AREA_FLAG_REGION_SIZE_UPDATE;
 }
@@ -2553,7 +2555,8 @@ void ED_region_floating_init(ARegion *region)
 
 void ED_region_cursor_set(wmWindow *win, ScrArea *area, ARegion *region)
 {
-  if (region && region->runtime->type->do_lock) {
+  if (region && region->runtime->type && region->runtime->type->do_lock) {
+    WM_cursor_set(win, WM_CURSOR_DEFAULT);
     return;
   }
 

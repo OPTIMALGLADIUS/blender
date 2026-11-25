@@ -179,17 +179,18 @@ struct VKWorkarounds {
   bool compute_pipeline_fallback = false;
 
   /**
-   * Clear depth/stencil through `vkCmdClearDepthStencilImage` instead of
-   * `vkCmdClearAttachments`.
+   * Some Qualcomm drivers keep command-buffer-local state written by `vkCmdSetViewport` across
+   * command buffer resets.
    *
-   * `vkCmdClearAttachments` is allowed inside a dynamic rendering scope, but some drivers
-   * (AMD official and ARM's Mali) silently drop the depth/stencil clear there. The
-   * attachment then keeps the depth/stencil of the previous frame, so the next frame's
-   * geometry fails the depth test against its own stale fragments. On a static view that
-   * shows up as missing/inside-out faces that change between frames; while navigating it
-   * shows up as chunks of geometry disappearing.
+   * When set, viewports and scissors are baked into the pipeline as static state and
+   * `vkCmdSetViewport`/`vkCmdSetScissor` are never used.
    */
-  bool clear_depth_stencil_via_image = false;
+  bool static_viewport_scissor = false;
+
+  /**
+   * Legacy AMD drivers do not perform sRGB conversions when clearing attachments.
+   */
+  bool missing_srgb_clear_conversion = false;
 
   /** Log enabled workarounds. */
   void log() const;

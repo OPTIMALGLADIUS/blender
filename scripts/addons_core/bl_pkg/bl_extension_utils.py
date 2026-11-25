@@ -99,6 +99,9 @@ InfoItemSeq = Sequence[InfoItem]
 
 COMPLETE_ITEM = ('DONE', "")
 
+ASSETLIB_AUTH_METHOD_DEFAULT = 'PER_LIBRARY'
+ASSETLIB_AUTH_METHOD_VALID = {'PER_LIBRARY', 'FROM_REPOSITORY'}
+
 # Time to wait when there is no output, avoid 0 as it causes high CPU usage.
 IDLE_WAIT_ON_READ = 0.05
 # IDLE_WAIT_ON_READ = 0.2
@@ -233,12 +236,63 @@ def blender_ext_cmd(python_args: Sequence[str]) -> Sequence[str]:
 # Call JSON.
 #
 
+def command_output_from_thread(
+        args: Sequence[str],
+        use_idle: bool,
+) -> Generator[InfoItemSeq, bool, None]:
+    import queue
+    import threading
+    from .cli import blender_ext
+
+    messages: queue.SimpleQueue[InfoItem] = queue.SimpleQueue()
+    request_exit = threading.Event()
+
+    def msg_fn(ty: str, data: blender_ext.PrimTypeOrSeq) -> bool:
+        # Report completion only after the worker has finished cleaning up.
+        if ty != 'DONE':
+            messages.put((ty, data))
+        return request_exit.is_set()
+
+    def run() -> None:
+        try:
+            parsed_args = blender_ext.argparse_create().parse_args(args)
+            parsed_args.msglog = blender_ext.MessageLogger(msg_fn)
+            # Disable subprocess exit handling when running inside Blender.
+            parsed_args.force_exit_ok = False
+            parsed_args.func(parsed_args)
+        except (Exception, SystemExit) as ex:
+            messages.put(('FATAL_ERROR', str(ex)))
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    try:
+        while worker.is_alive() or not messages.empty():
+            batch: list[InfoItem] = []
+            while True:
+                try:
+                    batch.append(messages.get_nowait())
+                except queue.Empty:
+                    break
+
+            if not batch and use_idle:
+                time.sleep(IDLE_WAIT_ON_READ)
+            if (yield batch):
+                request_exit.set()
+    finally:
+        request_exit.set()
+
+
 def command_output_from_json_0(
         args: Sequence[str],
         use_idle: bool,
         *,
         python_args: Sequence[str],
 ) -> Generator[InfoItemSeq, bool, None]:
+    # Android cannot spawn the bundled Python executable. Run extension commands in a thread instead.
+    if sys.platform == 'android':
+        yield from command_output_from_thread(args, use_idle)
+        return
+
     cmd = [*blender_ext_cmd(python_args), *args, "--output-type=JSON_0"]
     # Note that the context-manager isn't used to wait until the process is finished as
     # the function only finishes when `poll()` is not none, it's just used to ensure file-handles
@@ -1216,6 +1270,20 @@ class PkgBlock_Normalized(NamedTuple):
         )
 
 
+# Sub-table of `PkgAssetLibrary_Normalized`, None when authentication is unsupported.
+class PkgAssetLibraryAuth_Normalized(NamedTuple):
+    required: bool
+    # Not constrained to methods this version of Blender knows about,
+    # the value is validated at build time.
+    auth_method: str
+
+
+# Sub-table of `PkgManifest_Normalized` when `type == "asset-library"`.
+class PkgAssetLibrary_Normalized(NamedTuple):
+    remote_url: str
+    auth: PkgAssetLibraryAuth_Normalized | None
+
+
 # See similar named tuple: `bl_pkg.cli.blender_ext.PkgManifest`.
 # This type is loaded from an external source and had its values parsed into a known "normalized" state.
 # Some transformation is performed to the purpose of displaying in the UI although this type isn't specifically for UI.
@@ -1245,6 +1313,9 @@ class PkgManifest_Normalized(NamedTuple):
     # Taken from the `blocklist`.
     block: PkgBlock_Normalized | None
 
+    # Populated when `type == "asset-library"`, otherwise None.
+    asset_library: PkgAssetLibrary_Normalized | None
+
     @staticmethod
     def from_dict_with_error_fn(
         manifest_dict: dict[str, Any],
@@ -1252,6 +1323,7 @@ class PkgManifest_Normalized(NamedTuple):
         # Only for useful error messages.
         pkg_idname: str,
         pkg_block: PkgBlock_Normalized | None,
+        from_repo: bool,
         error_fn: Callable[[Exception], None],
     ) -> "PkgManifest_Normalized | None":
         # NOTE: it is expected there are no errors here for typical usage.
@@ -1281,6 +1353,14 @@ class PkgManifest_Normalized(NamedTuple):
             # Remote only (not found in TOML files).
             field_archive_size = manifest_dict.get("archive_size", 0)
             field_archive_url = manifest_dict.get("archive_url", "")
+
+            # Sub-table, only valid for `type == "asset-library"` in local (TOML) manifests.
+            # Never carried in `index.json`; ignore for remote entries and for any local
+            # entry whose type doesn't match, defending against malformed manifests.
+            if from_repo or field_type != "asset-library":
+                field_asset_library = None
+            else:
+                field_asset_library = manifest_dict.get("asset_library")
 
         except KeyError as ex:
             error_fn(KeyError("{:s}: missing key {:s}".format(pkg_idname, str(ex))))
@@ -1344,9 +1424,53 @@ class PkgManifest_Normalized(NamedTuple):
             if not isinstance(field_archive_url, str):
                 raise TypeError("{:s}: \"archive_url\" must be a string".format(pkg_idname))
 
+            # Only validated when present; detailed schema enforcement happens at build time.
+            if field_asset_library is not None:
+                if not isinstance(field_asset_library, dict):
+                    raise TypeError("{:s}: \"asset_library\" must be a table".format(pkg_idname))
+                field_asset_library_remote_url = field_asset_library.get("remote_url", "")
+                if not (
+                        isinstance(field_asset_library_remote_url, str) and
+                        field_asset_library_remote_url
+                ):
+                    raise TypeError(
+                        "{:s}: \"asset_library.remote_url\" must be a non-empty string".format(pkg_idname))
+
+                field_asset_library_auth = field_asset_library.get("auth")
+                if field_asset_library_auth is not None:
+                    if not isinstance(field_asset_library_auth, dict):
+                        raise TypeError("{:s}: \"asset_library.auth\" must be a table".format(pkg_idname))
+                    field_asset_library_auth_required = field_asset_library_auth.get("required")
+                    if not isinstance(field_asset_library_auth_required, bool):
+                        raise TypeError(
+                            "{:s}: \"asset_library.auth.required\" must be a boolean".format(pkg_idname))
+                    field_asset_library_auth_method = field_asset_library_auth.get("auth_method", "")
+                    if not (
+                            isinstance(field_asset_library_auth_method, str) and
+                            field_asset_library_auth_method
+                    ):
+                        raise TypeError(
+                            "{:s}: \"asset_library.auth.auth_method\" must be a non-empty string".format(pkg_idname))
+
         except TypeError as ex:
             error_fn(ex)
             return None
+
+        if field_asset_library is not None:
+            if field_asset_library_auth is not None:
+                assert isinstance(field_asset_library_auth_required, bool)
+                asset_library_auth = PkgAssetLibraryAuth_Normalized(
+                    required=field_asset_library_auth_required,
+                    auth_method=field_asset_library_auth_method,
+                )
+            else:
+                asset_library_auth = None
+            asset_library = PkgAssetLibrary_Normalized(
+                remote_url=field_asset_library_remote_url,
+                auth=asset_library_auth,
+            )
+        else:
+            asset_library = None
 
         import re
         return PkgManifest_Normalized(
@@ -1369,6 +1493,8 @@ class PkgManifest_Normalized(NamedTuple):
             archive_url=field_archive_url,
 
             block=pkg_block,
+
+            asset_library=asset_library,
         )
 
 
@@ -1522,6 +1648,7 @@ def repository_parse_data_filtered(
                 item,
                 pkg_idname=pkg_idname,
                 pkg_block=pkg_block_map.get(pkg_idname),
+                from_repo=True,
                 error_fn=error_fn,
         )) is None:
             continue
@@ -1600,10 +1727,15 @@ class _RepoDataSource_ABC(metaclass=abc.ABCMeta):
             data = self._data_load(error_fn=error_fn)
         return data
 
+    @abc.abstractmethod
+    def assetlib_auth_method(self) -> str:
+        raise Exception("Caller must define")
+
 
 class _RepoDataSource_JSON(_RepoDataSource_ABC):
     __slots__ = (
         "_data",
+        "_assetlib_auth_method",
 
         "_filepath",
         "_filter_params",
@@ -1621,6 +1753,7 @@ class _RepoDataSource_JSON(_RepoDataSource_ABC):
         self._mtime: int = 0
         self._filter_params: PkgManifest_FilterParams = filter_params
         self._data: RepoRemoteData | None = None
+        self._assetlib_auth_method: str = ASSETLIB_AUTH_METHOD_DEFAULT
 
     def exists(self) -> bool:
         try:
@@ -1708,7 +1841,24 @@ class _RepoDataSource_JSON(_RepoDataSource_ABC):
         self._data = data
         self._mtime = mtime
 
+        assetlib_auth_method = data_dict.get("assetlib_auth_method", ASSETLIB_AUTH_METHOD_DEFAULT)
+        if not (isinstance(assetlib_auth_method, str) and assetlib_auth_method in ASSETLIB_AUTH_METHOD_VALID):
+            error_fn(Exception(
+                "Remote repository data from {:s} must have \"assetlib_auth_method\" set to one of ({:s}), "
+                "found {!r}, using \"{:s}\"".format(
+                    self._filepath,
+                    ", ".join(sorted(ASSETLIB_AUTH_METHOD_VALID)),
+                    assetlib_auth_method,
+                    ASSETLIB_AUTH_METHOD_DEFAULT,
+                )
+            ))
+            assetlib_auth_method = ASSETLIB_AUTH_METHOD_DEFAULT
+        self._assetlib_auth_method = assetlib_auth_method
+
         return data
+
+    def assetlib_auth_method(self) -> str:
+        return self._assetlib_auth_method
 
 
 class _RepoDataSource_TOML_FILES(_RepoDataSource_ABC):
@@ -1804,6 +1954,7 @@ class _RepoDataSource_TOML_FILES(_RepoDataSource_ABC):
                     item_local,
                     pkg_idname=pkg_idname,
                     pkg_block=None,
+                    from_repo=False,
                     error_fn=error_fn,
             )) is None:
                 continue
@@ -1876,6 +2027,12 @@ class _RepoDataSource_TOML_FILES(_RepoDataSource_ABC):
             return True
 
         return False
+
+    def assetlib_auth_method(self) -> str:
+        # Dummy, always default, it makes sense because its *only* needed
+        # when the asset library mirrors a remote repository that has authentication
+        # which isn't supported for local (TOML file) repositories.
+        return ASSETLIB_AUTH_METHOD_DEFAULT
 
 
 # -----------------------------------------------------------------------------
@@ -2020,6 +2177,7 @@ class _RepoCacheEntry:
                         item_local,
                         pkg_idname=pkg_idname,
                         pkg_block=None,
+                        from_repo=False,
                         error_fn=error_fn,
                 )) is not None:
                     pkg_manifest_local[pkg_idname] = value
@@ -2043,12 +2201,24 @@ class _RepoCacheEntry:
     def force_local_refresh(self) -> None:
         self._pkg_manifest_local = None
 
+    def assetlib_auth_method(
+            self,
+            *,
+            error_fn: Callable[[Exception], None],
+            ignore_missing: bool = False,
+    ) -> str:
+        # The value is only stored in the remote listing, ensure it has been read.
+        self.pkg_manifest_from_remote_ensure(error_fn=error_fn, ignore_missing=ignore_missing)
+        return self._pkg_manifest_remote_data_source.assetlib_auth_method()
+
 
 class RepoCacheStore:
     __slots__ = (
         "_repos",
         "_filter_params",
         "_is_init",
+        # Set when local manifests may have changed, cleared by the asset library sync.
+        "_asset_libraries_dirty",
     )
 
     def __init__(
@@ -2064,9 +2234,16 @@ class RepoCacheStore:
             python_version=python_version,
         )
         self._is_init = False
+        self._asset_libraries_dirty = True
 
     def is_init(self) -> bool:
         return self._is_init
+
+    def is_asset_libraries_dirty(self) -> bool:
+        return self._asset_libraries_dirty
+
+    def asset_libraries_dirty_clear(self) -> None:
+        self._asset_libraries_dirty = False
 
     def refresh_from_repos(
             self, *,
@@ -2088,6 +2265,7 @@ class RepoCacheStore:
                 repo_entry_test = _RepoCacheEntry(directory, remote_url, self._filter_params)
             self._repos.append(repo_entry_test)
         self._is_init = True
+        self._asset_libraries_dirty = True
 
     def refresh_remote_from_directory(
             self,
@@ -2113,6 +2291,7 @@ class RepoCacheStore:
             if directory == repo_entry.directory:
                 # Force refresh.
                 repo_entry.force_local_refresh()
+                self._asset_libraries_dirty = True
                 return repo_entry.pkg_manifest_from_local_ensure(
                     ignore_missing=ignore_missing,
                     error_fn=error_fn,
@@ -2166,12 +2345,24 @@ class RepoCacheStore:
     def clear(self) -> None:
         self._repos.clear()
         self._is_init = False
+        self._asset_libraries_dirty = True
+
+    def assetlib_auth_method_from_directory(
+            self,
+            directory: str,
+            *,
+            error_fn: Callable[[Exception], None],
+            ignore_missing: bool = False,
+    ) -> str:
+        for repo_entry in self._repos:
+            if directory == repo_entry.directory:
+                return repo_entry.assetlib_auth_method(error_fn=error_fn, ignore_missing=ignore_missing)
+        raise ValueError("Directory {:s} not a known repo".format(directory))
 
 
 # -----------------------------------------------------------------------------
 # Public Repo Lock
 #
-
 # Currently this is based on a path, this gives significant room without the risk of not being large enough.
 # The size limit is used to prevent over-allocating memory in the unlikely case a lot of data
 # is written into the lock file.

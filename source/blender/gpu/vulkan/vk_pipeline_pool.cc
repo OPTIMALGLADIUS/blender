@@ -165,6 +165,9 @@ static VkPipeline vk_compute_pipeline_noop(VKDevice &device,
   if (name.startswith("subdiv_")) {
     GPU_subdivision_evaluation_set_broken();
   }
+  if (name.startswith("eevee_shadow_")) {
+    GPU_eevee_shadows_set_broken();
+  }
   return vk_pipeline;
 }
 
@@ -711,8 +714,9 @@ VkPipeline VKPipelineMap<VKGraphicsInfo::Shaders>::create(
 {
   VKDevice &device = VKBackend::get().device;
   const VKExtensions &extensions = device.extensions_get();
+  const VKWorkarounds &workarounds = device.workarounds_get();
   VKGraphicsPipelineCreateInfoBuilder builder;
-  builder.build_shaders_lib(shaders_info, extensions, vk_pipeline_base);
+  builder.build_shaders_lib(shaders_info, extensions, workarounds, vk_pipeline_base);
 
   /* Build pipeline. */
   VkPipeline pipeline = VK_NULL_HANDLE;

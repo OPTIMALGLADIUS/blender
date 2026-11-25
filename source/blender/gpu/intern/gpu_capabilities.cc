@@ -170,6 +170,16 @@ void GPU_subdivision_evaluation_set_broken()
   GCaps.subdivision_evaluation_broken = true;
 }
 
+bool GPU_eevee_shadows_broken()
+{
+  return GCaps.eevee_shadows_broken;
+}
+
+void GPU_eevee_shadows_set_broken()
+{
+  GCaps.eevee_shadows_broken = true;
+}
+
 bool GPU_use_main_context_workaround()
 {
   return GCaps.use_main_context_workaround;
@@ -180,9 +190,14 @@ bool GPU_use_hq_normals_workaround()
   return GCaps.use_hq_normals_workaround;
 }
 
-bool GPU_stencil_clasify_buffer_workaround()
+bool GPU_frontbuffer_read_workaround()
 {
-  return GCaps.stencil_clasify_buffer_workaround;
+  return GCaps.frontbuffer_read_workaround;
+}
+
+bool GPU_stencil_classify_buffer_workaround()
+{
+  return GCaps.stencil_classify_buffer_workaround;
 }
 
 bool GPU_geometry_shader_support()

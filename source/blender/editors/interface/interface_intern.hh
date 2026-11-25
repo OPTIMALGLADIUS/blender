@@ -25,6 +25,7 @@
 #include "RNA_types.hh"
 
 #include "UI_interface.hh"
+#include "UI_interface_icons.hh"
 #include "UI_interface_layout.hh"
 #include "UI_resources.hh"
 
@@ -434,7 +435,7 @@ struct ButtonNumberSlider : public Button {
 
 /** Derived struct for #ButtonType::Color */
 struct ButtonColor : public Button {
-  bool is_pallete_color = false;
+  bool is_palette_color = false;
   int palette_color_index = -1;
 };
 
@@ -524,6 +525,12 @@ struct ButtonLabel : public Button {
   /** Maximum lines to be drawn in multi-line labels, 0 means all. */
   int max_lines = 0;
   FontStyleAlign text_align = UI_STYLE_TEXT_LEFT;
+};
+
+/** Derived struct for #ButtonType::Image. */
+struct ButtonImage : public Button {
+  /** Uniquely identifies the image, to reuse it from the previous redraw. */
+  std::string key;
 };
 
 /** Derived struct for #ButtonType::Scroll. */
@@ -1218,7 +1225,8 @@ PopupBlockHandle *popup_block_create(bContext *C,
                                      BlockHandleCreateFunc handle_create_func,
                                      void *arg,
                                      FreeArgFunc arg_free,
-                                     bool can_refresh);
+                                     bool can_refresh,
+                                     const int anchor_xy[2] = nullptr);
 /**
  * \param can_refresh: Allow menus to re-run their layout definitions using
  *    `ED_region_tag_refresh_ui()`. This can be used to update the grayed out state of items or the
@@ -1569,8 +1577,6 @@ bool icon_is_preview_deferred_loading(int icon_id, bool big);
 int id_icon_get(const bContext *C, ID *id, bool big);
 
 /* `interface_icons_event.cc` */
-
-float event_icon_offset(int icon_id);
 
 void icon_draw_rect_input(
     float x, float y, int w, int h, int icon_id, float aspect, float alpha, bool inverted);
