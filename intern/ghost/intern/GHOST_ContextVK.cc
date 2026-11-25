@@ -465,6 +465,7 @@ struct GHOST_InstanceVK {
 
     };
 
+
     VK_CHECK(volk::vkCreateInstance(&vk_instance_create_info, nullptr, &vk_instance), false);
     return true;
   }
@@ -1825,19 +1826,6 @@ GHOST_TSuccess GHOST_ContextVK::recreateSwapchain(bool use_hdr_swapchain)
     return GHOST_kFailure;
   }
 
-  /* Retire previous semaphores and swapchain before resizing frame_data_ so references
-   * into frame_data_[render_frame_] are never invalidated by reallocation. */
-  GHOST_FrameDiscard &current_discard_pile = frame_data_[render_frame_].discard_pile;
-  for (GHOST_Frame &frame : frame_data_) {
-    if (frame.acquire_semaphore != VK_NULL_HANDLE) {
-      current_discard_pile.semaphores.push_back(frame.acquire_semaphore);
-      frame.acquire_semaphore = VK_NULL_HANDLE;
-    }
-  }
-  if (old_swapchain != VK_NULL_HANDLE) {
-    current_discard_pile.swapchains.push_back(old_swapchain);
-  }
-
   /* image_count may not be what we requested! Getter for final value. */
   uint32_t actual_image_count = 0;
   device_vk.functions.vkGetSwapchainImagesKHR(
@@ -1853,7 +1841,7 @@ GHOST_TSuccess GHOST_ContextVK::recreateSwapchain(bool use_hdr_swapchain)
   std::vector<VkImage> swapchain_images(actual_image_count);
   device_vk.functions.vkGetSwapchainImagesKHR(
       device_vk.vk_device, swapchain_, &actual_image_count, swapchain_images.data());
-  for (uint32_t index = 0; index < actual_image_count; index++) {
+  for (int index = 0; index < actual_image_count; index++) {
     swapchain_images_[index].vk_image = swapchain_images[index];
   }
   CLOG_DEBUG(&LOG,
@@ -1881,8 +1869,22 @@ GHOST_TSuccess GHOST_ContextVK::recreateSwapchain(bool use_hdr_swapchain)
                       capabilities.minImageCount,
                       capabilities.maxImageCount);
 #endif
-
+  /* Construct new semaphores. It can be that image_count is larger than previously. We only need
+   * to fill in where the handle is `VK_NULL_HANDLE`. */
+  /* Previous handles from the frame data cannot be used and should be discarded. */
+  /* Re-fetched: the resize above may have reallocated `frame_data_`. */
+  GHOST_FrameDiscard &current_discard_pile = frame_data_[render_frame_].discard_pile;
+  for (GHOST_Frame &frame : frame_data_) {
+    if (frame.acquire_semaphore != VK_NULL_HANDLE) {
+      current_discard_pile.semaphores.push_back(frame.acquire_semaphore);
+    }
+    frame.acquire_semaphore = VK_NULL_HANDLE;
+  }
+  if (old_swapchain) {
+    current_discard_pile.swapchains.push_back(old_swapchain);
+  }
   initializeFrameData();
+
   image_count_ = actual_image_count;
 
   return GHOST_kSuccess;
