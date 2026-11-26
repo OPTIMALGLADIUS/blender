@@ -779,6 +779,26 @@ static void wm_draw_region_buffer_create(Scene *scene,
 
     region->runtime->draw_buffer->bound_view = -1;
     region->runtime->draw_buffer->stereo = stereo;
+
+    /* A freshly allocated draw buffer contains undefined memory. Only painting `drawrct` (a
+     * partial redraw left over from a previous frame, e.g. a hovered button) would leave the rest
+     * of the region showing that undefined memory, which reads back as colored noise. This is
+     * especially visible on Vulkan/Android where the memory is not zeroed. Force a full redraw of
+     * the region, and start the buffer from a defined color in case the draw callback bails out
+     * (e.g. `do_lock`) or does not cover the whole region. */
+    region->runtime->drawrct = rcti{};
+    region->runtime->do_draw &= ~(RGN_DRAW_PARTIAL | RGN_DRAW_NO_REBUILD |
+                                  RGN_DRAW_EDITOR_OVERLAYS);
+    region->runtime->do_draw |= RGN_DRAW;
+
+    if (region->runtime->draw_buffer->offscreen) {
+      /* Transparent black, matching the clear used for popup regions, so that this stays a no-op
+       * for regions that blend over the window frame-buffer. */
+      const float clear_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      GPU_texture_clear(GPU_offscreen_color_texture(region->runtime->draw_buffer->offscreen),
+                        GPU_DATA_FLOAT,
+                        clear_color);
+    }
   }
 }
 
@@ -996,8 +1016,15 @@ static void wm_draw_area_offscreen(bContext *C, wmWindow *win, ScrArea *area, bo
                                    (region.flag & RGN_FLAG_TOO_SMALL) &&
                                    !(region.flag & RGN_FLAG_HIDDEN);
 
-    if ((region.runtime->visible || ignore_visibility) && region.runtime->do_draw &&
-        region.runtime->type && region.runtime->type->layout)
+    /* A visible region without a draw buffer has never been painted. It still has to be laid out
+     * and drawn, otherwise the window frame-buffer keeps whatever was rendered there before
+     * (stale content, or undefined memory on Vulkan/Android). */
+    const bool needs_first_draw = region.runtime->visible &&
+                                  region.runtime->draw_buffer == nullptr;
+
+    if ((region.runtime->visible || ignore_visibility) &&
+        (region.runtime->do_draw || needs_first_draw) && region.runtime->type &&
+        region.runtime->type->layout)
     {
       /* Call space-level pre-draw callback if this is the first region to be laid out. */
       if (!is_any_region_drawn) {
@@ -1025,7 +1052,11 @@ static void wm_draw_area_offscreen(bContext *C, wmWindow *win, ScrArea *area, bo
 
   /* Then do actual drawing of regions. */
   for (ARegion &region : area->regionbase) {
-    if (!region.runtime->visible || !region.runtime->do_draw) {
+    /* Paint regions that are tagged for redraw, and regions that do not have a buffer yet (see
+     * above). Regions that still have a valid buffer are only blitted by the on-screen pass. */
+    if (!region.runtime->visible || region.runtime->type == nullptr ||
+        (!region.runtime->do_draw && region.runtime->draw_buffer != nullptr))
+    {
       continue;
     }
 
@@ -1635,6 +1666,14 @@ static bool wm_draw_update_test_window(Main *bmain, bContext *C, wmWindow *win)
 #endif
 
       if (region.runtime->visible && region.runtime->do_draw) {
+        do_draw = true;
+      }
+      /* A visible region that has never been painted leaves a hole in the window frame-buffer,
+       * which keeps stale or undefined content (visible as colored noise on Vulkan/Android).
+       * Draw once so it gets a buffer that the on-screen pass can blit. */
+      if (region.runtime->visible && region.runtime->draw_buffer == nullptr &&
+          region.winx > 0 && region.winy > 0)
+      {
         do_draw = true;
       }
     }

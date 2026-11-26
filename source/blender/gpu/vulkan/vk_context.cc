@@ -9,6 +9,7 @@
 #include "DNA_userdef_types.h"
 
 #include "GPU_debug.hh"
+#include "GPU_texture.hh"
 
 #include "gpu_capabilities_private.hh"
 
@@ -95,6 +96,13 @@ void VKContext::sync_backbuffer()
           to_gpu_format(swap_chain_data.surface_format.format),
           GPU_TEXTURE_USAGE_ATTACHMENT | GPU_TEXTURE_USAGE_SHADER_READ,
           nullptr);
+
+      /* The recreated back-buffer holds undefined memory. The window manager only blits the
+       * regions that have a valid buffer, so any pixel it does not cover would be presented as
+       * garbage (colored noise) instead of the previous frame. Start from an opaque color so a
+       * reset back-buffer degrades to a plain background instead of visual corruption. */
+      const float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+      GPU_texture_clear(surface_texture_, GPU_DATA_FLOAT, clear_color);
 
       back_left->attachment_set(GPU_FB_COLOR_ATTACHMENT0,
                                 GPU_ATTACHMENT_TEXTURE(surface_texture_));
